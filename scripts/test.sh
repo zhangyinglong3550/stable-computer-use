@@ -6,7 +6,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 echo "==> 构建 scu-ax"
-( cd runtime && swift build -c release ) || { echo "构建失败"; exit 1; }
+build() { ( cd runtime && swift build -c release ); }
+
+if ! build; then
+  # 常见于仓库目录被改名/移动：.build 里的 PCH 记着旧绝对路径，必须清掉重建
+  echo "构建失败，清理 .build 后重试一次（目录移动会导致模块缓存路径失效）"
+  rm -rf runtime/.build
+  build || { echo "构建仍然失败，请检查 Xcode Command Line Tools"; exit 1; }
+fi
 
 fail=0
 
