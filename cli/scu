@@ -631,11 +631,14 @@ def cmd_doctor(args) -> int:
         "macos": health.get("macos"),
         "decider": "jev" if os.environ.get("TYPESAFE_API_KEY") else "off",
     }
+    payload["windowUsable"] = health.get("windowUsable")
     if not healthy:
         payload["reasonCode"] = health.get("reasonCode") or "permission_missing"
         payload["hint"] = health.get("hint") or (
             "到 系统设置 → 隐私与安全性 → 辅助功能，勾选你的终端，然后重试")
-    return out(payload, 0 if healthy else (10 if health.get("reasonCode") == "ax_cannot_complete" else 3))
+    code = {"ax_cannot_complete": 10, "no_accessible_windows": 3}.get(
+        health.get("reasonCode"), 3)
+    return out(payload, 0 if healthy else code)
 
 
 def cmd_apps(args) -> int:
@@ -667,7 +670,7 @@ def cmd_snapshot(args) -> int:
 EXIT_CODES = {
     "stale_ref": 5, "text_not_found": 6, "disabled": 7, "no_geometry": 8,
     "app_not_found": 2, "no_window": 3, "ax_timeout": 9, "ax_cannot_complete": 10,
-    "needs_takeover": 11, "user_active": 12,
+    "no_accessible_windows": 3, "needs_takeover": 11, "user_active": 12,
     "no_element_at_point": 13, "no_ax_action_at_point": 13, "no_ax_action": 13,
     "ax_action_failed": 14, "recipe_not_found": 2,
 }

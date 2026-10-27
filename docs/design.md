@@ -288,6 +288,10 @@ AXUIElementCreateApplication(front.pid) + kAXRoleAttribute  →  0 (success)
 
 ### C. 窗口全部变成 app 代理 —— AX 服务真的无响应
 
+`scu doctor` 现在会单独报这个：`accessibilityUsable: true` 但 `windowUsable: false`，
+reasonCode 是 `no_accessible_windows`，exit 3。**只看第一项会误报可用** —— 这就是
+"doctor 说行、snapshot 说 no_window" 的根源。
+
 症状很有辨识度：
 
 | 现象 | 说明 |

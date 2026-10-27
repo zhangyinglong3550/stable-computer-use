@@ -736,20 +736,43 @@ case "doctor":
         axUsable = (probeErr == .success && probe != nil)
     }
 
+    // 第二项：能不能真的拿到窗口。
+    // 实测存在一种状态 —— AXRole 读得到，但 kAXWindowsAttribute 返回的全是 app 代理
+    // （CFEqual(app, w) == true，没有位置/尺寸）。此时所有 snapshot 都会 no_window。
+    // 常见于显示器休眠 / 长时间无操作。光看第一项会误报"可用"。
+    var windowUsable = false
+    var windowProbeApp = "-"
+    for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+        let ax = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(ax, 0.8)
+        guard let ws = attr(ax, kAXWindowsAttribute) as? [AXUIElement] else { continue }
+        if ws.contains(where: { isWindow($0) }) {
+            windowUsable = true
+            windowProbeApp = app.localizedName ?? app.bundleIdentifier ?? "?"
+            break
+        }
+    }
+
     var payload: [String: Any] = [
         "accessibility": trusted,
         "accessibilityUsable": axUsable,
         "axProbeCode": Int(probeErr.rawValue),
         "axProbeTarget": probeTarget,
+        "windowUsable": windowUsable,
+        "windowProbeApp": windowProbeApp,
         "screen_recording": screen,
         "macos": ProcessInfo.processInfo.operatingSystemVersionString,
-        "ok": trusted && axUsable,
+        "ok": trusted && axUsable && windowUsable,
     ]
     if !axUsable {
         payload["reasonCode"] = probeErr == .cannotComplete ? "ax_cannot_complete" : "ax_unusable"
         payload["hint"] = probeErr == .cannotComplete
             ? "AX 返回 -25204（cannotComplete）：通常是屏幕已锁定、或当前不是活动 GUI 会话。解锁后重试。"
             : "辅助功能权限虽显示已授权，但 AX 调用失败。到 系统设置 → 隐私与安全性 → 辅助功能 把终端关掉再打开。"
+    } else if !windowUsable {
+        payload["reasonCode"] = "no_accessible_windows"
+        payload["hint"] = "AX 能读，但没有任何 app 暴露真实窗口（拿回来的都是 app 代理，没有位置和尺寸）。"
+                         + "常见于显示器休眠 / 长时间无操作。唤醒屏幕、把目标窗口调出来再试。"
     }
     emit(payload)
 

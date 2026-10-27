@@ -110,6 +110,9 @@ scu recipe list                           # 录过的步骤序列
 | `empty_snapshot` | 这个 app 没暴露 AX 树 | Electron 类 app 常见，改用 `scu shot` + 坐标 |
 | `ax_cannot_complete` | AX 返回 -25204 | **屏幕锁了或不是活动 GUI 会话**。请用户解锁后重试，别硬试 |
 | `no_window` | app 没可用窗口 | 窗口被最小化或在别的 Space，请用户调出来 |
+| `no_accessible_windows` | AX 能读但所有窗口都是代理 | 显示器休眠 / 长时间无操作。请用户唤醒屏幕，别反复重试 |
+| `needs_takeover` | 该动作会打断用户 | **不要绕**。换 AX 路径，或问用户 |
+| `user_active` | 用户刚在操作 | 等一会儿重试，别抢 |
 
 先跑 `scu doctor`。`accessibility` 为 `true` 但 `accessibilityUsable` 为 `false` 时，工具实际不可用 —— 不要假设能操作。
 
