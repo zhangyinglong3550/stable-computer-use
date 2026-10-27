@@ -239,6 +239,18 @@ class TestNonIntrusive(unittest.TestCase):
         after = self._mouse()
         self.assertEqual(before, after, "命中测试点击不应该移动鼠标")
 
+    def test_never_falls_back_to_context_menu(self):
+        """回归：祖先回退绝不能选 AXShowMenu —— 那会弹出右键菜单。"""
+        src = (ROOT / "runtime" / "Sources" / "scu-ax" / "main.swift").read_text(encoding="utf-8")
+        # 找 preferred 那行，确认不含 AXShowMenu
+        for line in src.splitlines():
+            if "let preferred = [" in line:
+                self.assertNotIn("AXShowMenu", line,
+                                 "pressable 的动作回退列表里不能有 AXShowMenu")
+                break
+        else:
+            self.fail("没找到 preferred 定义")
+
     def test_takeover_requires_explicit_opt_in(self):
         """不显式 --take-over 时，抢焦点的路径必须拒绝。"""
         d, code = run("click", "--app", APP, "--xy", "10,10", "--via", "mouse")

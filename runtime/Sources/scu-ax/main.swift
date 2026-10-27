@@ -621,7 +621,10 @@ func elementAtPoint(_ pid: pid_t, _ p: CGPoint) -> AXUIElement? {
 
 /// 从命中的元素往上找第一个能"按"的祖先（图标命中的往往是 AXImage，本身没动作）
 func pressable(_ el: AXUIElement, maxHops: Int = 10) -> (element: AXUIElement, action: String)? {
-    let preferred = ["AXPress", "AXOpen", "AXConfirm", "AXPick", "AXShowMenu"]
+    // 只接受"按压类"动作。
+    // AXShowMenu 会弹出右键菜单 —— 实测在企微会话列表上把祖先回退到它，
+    // 结果弹了一个上下文菜单，属于明显的误操作。宁可失败也不要乱弹。
+    let preferred = ["AXPress", "AXOpen", "AXConfirm", "AXPick"]
     var cur: AXUIElement? = el
     var hops = 0
     while let c = cur, hops < maxHops {
@@ -876,6 +879,7 @@ case "act":
 
         // 默认永远先试 AX；只有显式 --via mouse 才动鼠标
         if !wantMouse {
+            // 注意：这里刻意不含 AXShowMenu
             for act in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where n.actions.contains(act) {
                 if AXUIElementPerformAction(s.elems[target], act as CFString) == .success {
                     emit(["ok": true, "op": "click", "ref": n.ref, "via": "ax", "action": act])
