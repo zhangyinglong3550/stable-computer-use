@@ -716,7 +716,186 @@ func writeText(into el: AXUIElement, _ text: String) -> Bool {
     return false
 }
 
+
+// MARK: - 常驻 daemon：消除「每步重走全树」
+//
+// 慢的根因：每次动作都要 spawn 进程 + 重新遍历整棵 AX 树 + 序列化 JSON。
+// 大 app（企微 3774 节点）光快照就 780ms，点一下要 1 秒。
+//
+// daemon 的思路和 Codex 一致：**walk 一次，把 AXUIElement 活着留着**。
+// 之后的动作直接用缓存里的元素对象，不再走树 —— 这是微秒级和秒级的区别。
+
+var cache: [String: AXUIElement] = [:]      // ref -> 活元素
+var cacheMeta: [String: [String: Any]] = [:] // ref -> 元信息
+var cacheApp = ""
+var cacheWindow = ""
+
+func cacheStore(_ snap: Snapshot) {
+    cache.removeAll(keepingCapacity: true)
+    cacheMeta.removeAll(keepingCapacity: true)
+    cacheApp = snap.app.app.bundleIdentifier ?? ""
+    cacheWindow = snap.title
+    for i in snap.nodes.indices where snap.keep[i] {
+        let ref = snap.nodes[i].ref
+        cache[ref] = snap.elems[i]
+        var m: [String: Any] = ["role": snap.nodes[i].role, "enabled": snap.nodes[i].enabled]
+        if let l = snap.nodes[i].label { m["label"] = l }
+        if let v = snap.nodes[i].value { m["value"] = v }
+        if !snap.nodes[i].actions.isEmpty { m["actions"] = snap.nodes[i].actions }
+        cacheMeta[ref] = m
+    }
+}
+
+/// 在缓存元素上直接执行"按压类"动作。不重走树。
+func cachedPress(_ ref: String) -> [String: Any] {
+    guard let el = cache[ref] else {
+        return ["ok": false, "reasonCode": "cache_miss", "ref": ref]
+    }
+    var acts: CFArray?
+    AXUIElementCopyActionNames(el, &acts)
+    let list = (acts as? [String]) ?? []
+    for want in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where list.contains(want) {
+        if AXUIElementPerformAction(el, want as CFString) == .success {
+            return ["ok": true, "op": "click", "ref": ref, "action": want, "via": "daemon-cache"]
+        }
+    }
+    return ["ok": false, "reasonCode": "no_ax_action", "ref": ref, "actions": list]
+}
+
+func writeLine(_ fd: Int32, _ obj: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return }
+    var payload = data
+    payload.append(0x0A)
+    payload.withUnsafeBytes { buf in
+        _ = Darwin.write(fd, buf.baseAddress, buf.count)
+    }
+}
+
+func handleClient(_ fd: Int32) {
+    var buf = [UInt8]()
+    var tmp = [UInt8](repeating: 0, count: 65536)
+    while true {
+        let n = Darwin.read(fd, &tmp, tmp.count)
+        if n <= 0 { break }
+        buf.append(contentsOf: tmp[0..<n])
+        if buf.contains(0x0A) { break }
+    }
+    guard let text = String(bytes: buf, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+        writeLine(fd, ["ok": false, "reasonCode": "empty_request"]); return
+    }
+    guard let req = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else {
+        writeLine(fd, ["ok": false, "reasonCode": "bad_json"]); return
+    }
+    let cmd = req["cmd"] as? String ?? ""
+    let appSpec = req["app"] as? String ?? ""
+
+    switch cmd {
+    case "ping":
+        writeLine(fd, ["ok": true, "pid": getpid(), "cached": cache.count, "app": cacheApp])
+
+    case "snapshot":
+        let maxN = req["max"] as? Int ?? 4000
+        let snap = snapshot(appSpec, maxN: maxN)
+        cacheStore(snap)
+        var out = toJSON(snap)
+        out["cached"] = cache.count
+        writeLine(fd, out)
+
+    case "click":
+        if let ref = req["ref"] as? String {
+            var r = cachedPress(ref)
+            if r["ok"] as? Bool != true {
+                // 缓存失效 → 重取一次再试
+                let snap = snapshot(appSpec)
+                cacheStore(snap)
+                r = cachedPress(ref)
+            }
+            // 重取后还是没有这个 ref：是过期引用，不是未知错误
+            if (r["reasonCode"] as? String) == "cache_miss" {
+                r = ["ok": false, "reasonCode": "stale_ref", "ref": ref]
+            }
+            writeLine(fd, r)
+        } else if let x = req["x"] as? Double, let y = req["y"] as? Double {
+            let app = resolveApp(appSpec)
+            guard let hit = elementAtPoint(app.app.processIdentifier, CGPoint(x: x, y: y)),
+                  let t = pressable(hit) else {
+                writeLine(fd, ["ok": false, "reasonCode": "no_ax_action_at_point"])
+                return
+            }
+            let err = AXUIElementPerformAction(t.element, t.action as CFString)
+            writeLine(fd, ["ok": err == .success, "action": t.action, "via": "daemon-hit-test"])
+        } else {
+            writeLine(fd, ["ok": false, "reasonCode": "bad_args"])
+        }
+
+    case "set":
+        guard let ref = req["ref"] as? String, let v = req["value"] as? String,
+              let el = cache[ref] else {
+            writeLine(fd, ["ok": false, "reasonCode": "cache_miss"]); return
+        }
+        let ok = writeText(into: el, v)
+        writeLine(fd, ["ok": ok, "ref": ref])
+
+    case "type":
+        guard let t = req["text"] as? String else {
+            writeLine(fd, ["ok": false, "reasonCode": "bad_args"]); return
+        }
+        let app = resolveApp(appSpec)
+        var focused: CFTypeRef?
+        if AXUIElementCopyAttributeValue(app.ax, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+           let el = focused as! AXUIElement?, writeText(into: el, t) {
+            writeLine(fd, ["ok": true, "chars": t.count, "via": "ax"])
+        } else {
+            writeLine(fd, ["ok": false, "reasonCode": "needs_takeover"])
+        }
+
+    case "invalidate":
+        cache.removeAll(); cacheMeta.removeAll(); cacheApp = ""
+        writeLine(fd, ["ok": true])
+
+    case "shutdown":
+        writeLine(fd, ["ok": true])
+        exit(0)
+
+    default:
+        writeLine(fd, ["ok": false, "reasonCode": "unknown_cmd", "cmd": cmd])
+    }
+}
+
+func serveDaemon(path: String) -> Never {
+    unlink(path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { die("socket() failed", code: 20) }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(path.utf8.prefix(103))
+    withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+        raw.copyBytes(from: pathBytes)
+        raw[pathBytes.count] = 0
+    }
+    let rc = withUnsafePointer(to: &addr) { p in
+        p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard rc == 0 else { die("bind failed: \(String(cString: strerror(errno)))", code: 20) }
+    guard listen(fd, 64) == 0 else { die("listen failed", code: 20) }
+    print("READY \(path)")
+    fflush(stdout)
+    while true {
+        let c = accept(fd, nil, nil)
+        if c < 0 { continue }
+        handleClient(c)
+        close(c)
+    }
+}
+
 switch cmd {
+
+case "serve":
+    let sock = args.flag("socket") ?? (NSTemporaryDirectory() + "scu-ax.sock")
+    serveDaemon(path: sock)
 
 case "doctor":
     let trusted = AXIsProcessTrusted()

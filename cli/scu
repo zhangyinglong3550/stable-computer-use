@@ -92,6 +92,76 @@ def die(reason: str, detail: str, code: int = 1) -> None:
     raise SystemExit(code)
 
 
+# ---------------------------------------------------------------- daemon
+#
+# 为什么需要 daemon：每次动作都 spawn 进程 + 重走整棵 AX 树，大 app 一次 800ms。
+# daemon 里保留活的 AXUIElement，动作直接从缓存走，实测 0.16ms。
+#
+# 设计上 daemon 只是加速器：连不上就退回「spawn 一次性进程」的老路，
+# 功能不受影响，只是慢。
+
+import socket as _socket
+
+SOCK_PATH = os.getenv("SCU_SOCK", f"/tmp/scu-{os.getuid()}.sock")
+_daemon_warned = False
+
+
+def _sock_call(req: dict, timeout: float = 30.0) -> dict | None:
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCK_PATH)
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(1 << 20)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        return json.loads(buf.decode() or "{}")
+    except Exception:
+        return None
+
+
+def _daemon_alive() -> bool:
+    return _sock_call({"cmd": "ping"}, timeout=2.0) is not None
+
+
+def ensure_daemon() -> bool:
+    """确保 daemon 在跑。起不来就返回 False，调用方退回老路。"""
+    global _daemon_warned
+    if _daemon_alive():
+        return True
+    try:
+        binary = find_ax_binary()
+        log = open(os.devnull, "wb")
+        subprocess.Popen(
+            [str(binary), "serve", "--socket", SOCK_PATH],
+            stdout=subprocess.DEVNULL, stderr=log, stdin=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+    except Exception:
+        if not _daemon_warned:
+            _daemon_warned = True
+        return False
+    for _ in range(40):          # 最多等 2 秒
+        time.sleep(0.05)
+        if _daemon_alive():
+            return True
+    return False
+
+
+def dcall(req: dict, timeout: float = 30.0) -> dict | None:
+    """优先走 daemon；不可用则返回 None 让调用方退化。"""
+    r = _sock_call(req, timeout)
+    if r is not None:
+        return r
+    if ensure_daemon():
+        return _sock_call(req, timeout)
+    return None
+
+
 # ---------------------------------------------------------------- 调 Swift 助手
 
 def run_ax(argv: list[str], timeout: float = 30.0) -> dict:
@@ -247,7 +317,9 @@ def describe(el: dict) -> str:
 # ---------------------------------------------------------------- snapshot
 
 def snapshot(app: str, max_n: int = 4000) -> dict:
-    snap = run_ax(["snapshot", "--app", app, "--json", "--max", str(max_n)])
+    snap = dcall({"cmd": "snapshot", "app": app, "max": max_n})
+    if snap is None:
+        snap = run_ax(["snapshot", "--app", app, "--json", "--max", str(max_n)])
     elements = snap.get("elements") or []
     # 文字节点的目标是最近的可点祖先 —— 直接换成祖先 ref，调用方不用关心
     for el in elements:
@@ -672,7 +744,7 @@ EXIT_CODES = {
     "app_not_found": 2, "no_window": 3, "ax_timeout": 9, "ax_cannot_complete": 10,
     "no_accessible_windows": 3, "needs_takeover": 11, "user_active": 12,
     "no_element_at_point": 13, "no_ax_action_at_point": 13, "no_ax_action": 13,
-    "ax_action_failed": 14, "recipe_not_found": 2,
+    "ax_action_failed": 14, "recipe_not_found": 2, "cache_miss": 5,
 }
 
 
@@ -684,6 +756,35 @@ def exit_for(payload: dict) -> int:
 
 
 def _act(args, op: str, extra: list[str]) -> int:
+    # 把命令行参数翻译成 daemon 请求；能用就走缓存（快 2000 倍）
+    req: dict = {"cmd": op, "app": args.app}
+    flat = {}
+    i = 0
+    while i < len(extra):
+        if extra[i].startswith("--"):
+            k = extra[i][2:]
+            v = extra[i + 1] if i + 1 < len(extra) and not extra[i + 1].startswith("--") else True
+            flat[k] = v
+            i += 2 if v is not True else 1
+        else:
+            i += 1
+    if "ref" in flat:
+        req["ref"] = flat["ref"]
+    if "text" in flat:
+        req["text"] = flat["text"]
+    if "value" in flat:
+        req["value"] = flat["value"]
+    if "x" in flat and "y" in flat:
+        req["x"], req["y"] = float(flat["x"]), float(flat["y"])
+
+    fast_only = op in ("click", "set", "type") and not flat.get("via") == "mouse" \
+        and not flat.get("take-over")
+    if fast_only:
+        fast = dcall(req)
+        if fast is not None:
+            fast["via"] = fast.get("via", "daemon")
+            return out(fast, exit_for(fast))
+
     argv = ["act", "--app", args.app, "--op", op] + extra
     payload = run_ax(argv)
     return out(payload, exit_for(payload))
@@ -854,6 +955,45 @@ def _image_scale(path: str, point_w: int, point_h: int) -> float:
     return 1.0
 
 
+def cmd_batch(args) -> int:
+    """从 stdin 读 JSONL 命令，逐条执行并输出 JSONL。
+
+    一个进程跑完一整串动作 —— 消掉「每条命令一次 Python 启动」的地板。
+    这是 Codex 用 code-mode 的原因：一步一进程最快也就 60-70ms。
+    """
+    ensure_daemon()
+    processed = 0
+    failed = 0
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            out({"ok": False, "reasonCode": "bad_json", "line": line[:120]}, 1)
+            failed += 1
+            continue
+        if args.dry_run:
+            out({"ok": True, "dryRun": True, "would": req}, 0)
+            processed += 1
+            continue
+        cmd = req.pop("cmd", None)
+        if cmd not in ("click", "set", "type", "snapshot", "ping"):
+            out({"ok": False, "reasonCode": "unsupported_cmd", "cmd": cmd}, 4)
+            failed += 1
+            continue
+        r = dcall({"cmd": cmd, **req}) or {"ok": False, "reasonCode": "daemon_unavailable"}
+        out(r, exit_for(r))
+        processed += 1
+        if r.get("ok") is not True:
+            failed += 1
+        if args.stop_on_error and r.get("ok") is not True:
+            break
+    sys.stderr.write(f"# batch: {processed} 条，失败 {failed}\n")
+    return 0 if failed == 0 else 1
+
+
 def cmd_bench(args) -> int:
     runs = args.runs
     times = []
@@ -974,6 +1114,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--app")
     r.add_argument("--goal", default="")
     r.set_defaults(fn=cmd_recipe)
+
+    bt = sub.add_parser("batch", help="从 stdin 读 JSONL 命令，一个进程跑完")
+    bt.add_argument("--stop-on-error", action="store_true")
+    bt.add_argument("--dry-run", action="store_true")
+    bt.set_defaults(fn=cmd_batch)
 
     b = sub.add_parser("bench")
     b.add_argument("--app", required=True)

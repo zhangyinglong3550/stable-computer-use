@@ -108,7 +108,30 @@ Chrome  逐属性  44.0ms → 批量 16.7ms   (2.63x)
 
 对比一下成本：JEV 从国内实测 1.2–4.4s，大模型一步数秒。**本地这层比模型层快 40–120 倍。**
 
-### 2. 六级快路径，越前面的越少花钱
+### 2. 常驻 daemon + 活元素缓存
+
+慢的根因不是「点击」慢，是**每步都 spawn 进程 + 重走整棵树**。大 app（企微 3774 节点）
+一次快照 800ms，点一下要 1 秒。
+
+现在 `scu` 自动拉起一个常驻 `scu-ax` daemon，把 `AXUIElement` **活着留着**。动作直接从缓存走：
+
+| 路径 | 耗时 |
+|---|---|
+| 老路：`scu click --ref`（每步重走树） | **~1000 ms** |
+| daemon 缓存命中，单条命令 | **~75 ms**（其中 ~60ms 是 Python 启动） |
+| daemon 缓存命中，`scu batch` 一个进程跑多条 | **0.16 – 0.7 ms / 次** |
+
+`scu batch` 从 stdin 读 JSONL，一个进程跑完一整串动作 —— 这是 Codex 用 code-mode 的原因：
+一步一进程最快也就 60ms 地板。
+
+```bash
+# 100 次动作，一个进程，约 70ms 总计
+echo '{"cmd":"click","app":"Finder","ref":"3netay"}' | scu batch
+```
+
+剩下的成本是**快照本身**（企微 800ms）。它只在界面变了才需要重取 —— 缓存动作不需要。
+
+### 3. 六级快路径，越前面的越少花钱
 
 不是「要么本地要么模型」，而是一条阶梯：
 
@@ -129,7 +152,7 @@ $ scu decide --app com.apple.finder --goal '点击"搜索"'
  "confidence": 1.0, "confidenceGate": "high", "recommendedAction": "act"}
 ```
 
-### 3. 记忆让重复任务归零
+### 4. 记忆让重复任务归零
 
 ```bash
 # 第一次：本地打分说不准 → 走 JEV 或交给你自己的 LLM

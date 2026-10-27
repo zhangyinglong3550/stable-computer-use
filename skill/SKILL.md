@@ -83,6 +83,21 @@ scu remember --app "Finder" --goal "回到上一个文件夹" --ref mkq0ob
 - **`stale_ref` 不是错误，是提示**：重新 snapshot 拿新 ref 再重试
 - **文字节点自动解析到祖先**：Snapshot JSON 里 `target_ref` 已经是最近的可点祖先，`scu click --ref` 用 `ref` 也行（内部会解析）
 
+## 要连续做很多步时，用 batch
+
+一条命令起一个进程，每条有 ~60ms 启动地板。要连点几十下（比如拖滑块、连发消息），
+把动作写成 JSONL 一次性喂进去：
+
+```bash
+scu batch <<'EOF'
+{"cmd":"click","app":"Finder","ref":"abc123"}
+{"cmd":"type","app":"Finder","text":"hello"}
+{"cmd":"ping"}
+EOF
+```
+
+一个进程跑完，每次动作 0.16–0.7ms。**这是唯一能做到"跟手"的用法。**
+
 ## 常用命令
 
 ```bash
@@ -95,6 +110,7 @@ scu scroll --app A --ref R --direction down --pages 2
 scu set   --app A --ref R --value "..."   # 直接写值，比打字快
 scu shot  --app A --out /tmp/a.png        # 窗口截图（兜底用）
 scu recipe list                           # 录过的步骤序列
+scu batch                                 # 从 stdin 读 JSONL，一个进程跑多条（最快）
 ```
 
 ## 什么时候别用它
