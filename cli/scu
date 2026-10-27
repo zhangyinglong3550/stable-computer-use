@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""smac — stable-mac: 给任意 Agent 的 macOS 精准 computer-use CLI。
+"""scu — stable-computer-use: 给任意 Agent 的 macOS 精准 computer-use CLI。
 
 设计要点
 - 单文件、纯标准库、无构建步骤（Swift 助手用 swift build 出，本文件只管调用）
@@ -8,20 +8,20 @@
 - 统一 reasonCode + exit code，调用方只写一条降级分支
 
 命令
-  smac doctor
-  smac apps
-  smac snapshot --app APP [--json] [--max N]
-  smac click --app APP (--ref R | --text T | --xy X,Y) [--via auto|ax|mouse]
-  smac type  --app APP --text T [--ref R]
-  smac key   --app APP --key "super+s"
-  smac scroll --app APP --ref R --direction down [--pages N]
-  smac set   --app APP --ref R --value V
-  smac verify --app APP --ref R
-  smac do    --app APP --goal "..."
-  smac decide --app APP --goal "..." [--no-decider] [--min-confidence X]
-  smac recipe save NAME < steps.json
-  smac recipe run  NAME --app APP
-  smac bench --app APP [--runs N]
+  scu doctor
+  scu apps
+  scu snapshot --app APP [--json] [--max N]
+  scu click --app APP (--ref R | --text T | --xy X,Y) [--via auto|ax|mouse]
+  scu type  --app APP --text T [--ref R]
+  scu key   --app APP --key "super+s"
+  scu scroll --app APP --ref R --direction down [--pages N]
+  scu set   --app APP --ref R --value V
+  scu verify --app APP --ref R
+  scu do    --app APP --goal "..."
+  scu decide --app APP --goal "..." [--no-decider] [--min-confidence X]
+  scu recipe save NAME < steps.json
+  scu recipe run  NAME --app APP
+  scu bench --app APP [--runs N]
 """
 
 from __future__ import annotations
@@ -45,36 +45,36 @@ VERSION = "0.1.0"
 # ---------------------------------------------------------------- 运行时定位
 
 HOME = Path.home()
-STATE_DIR = Path(os.getenv("SMAC_STATE", str(HOME / ".stable-mac")))
+STATE_DIR = Path(os.getenv("SCU_STATE", str(HOME / ".stable-computer-use")))
 RECIPE_DIR = STATE_DIR / "recipes"
 DECIDER_STATE_PATH = STATE_DIR / "decider-state.json"
 MEMORY_PATH = STATE_DIR / "memory.jsonl"
 
 
 def find_ax_binary() -> Path:
-    """按优先级找 smac-ax：环境变量 → 仓库内构建产物 → PATH。"""
-    env = os.getenv("SMAC_AX")
+    """按优先级找 scu-ax：环境变量 → 仓库内构建产物 → PATH。"""
+    env = os.getenv("SCU_AX")
     if env:
         p = Path(env).expanduser()
         if p.is_file():
             return p
-        die("ax_binary_missing", f"SMAC_AX 指向的文件不存在：{p}", 2)
+        die("ax_binary_missing", f"SCU_AX 指向的文件不存在：{p}", 2)
 
     here = Path(__file__).resolve().parent
-    for rel in ("runtime/.build/release/smac-ax", "runtime/.build/debug/smac-ax"):
+    for rel in ("runtime/.build/release/scu-ax", "runtime/.build/debug/scu-ax"):
         p = here.parent / rel
         if p.is_file():
             return p
 
     from shutil import which
 
-    found = which("smac-ax")
+    found = which("scu-ax")
     if found:
         return Path(found)
     die(
         "ax_binary_missing",
-        "找不到 smac-ax。先在 runtime/ 下执行 `swift build -c release`，"
-        "或设置 SMAC_AX 指向可执行文件。",
+        "找不到 scu-ax。先在 runtime/ 下执行 `swift build -c release`，"
+        "或设置 SCU_AX 指向可执行文件。",
         2,
     )
 
@@ -103,12 +103,12 @@ def run_ax(argv: list[str], timeout: float = 30.0) -> dict:
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        die("ax_timeout", f"smac-ax {' '.join(argv)} 超时 {timeout}s", 9)
+        die("ax_timeout", f"scu-ax {' '.join(argv)} 超时 {timeout}s", 9)
     elapsed = int((time.time() - started) * 1000)
 
     raw = (proc.stdout or "").strip()
     if not raw:
-        detail = (proc.stderr or "").strip()[:300] or "smac-ax 无输出"
+        detail = (proc.stderr or "").strip()[:300] or "scu-ax 无输出"
         # Swift 侧用 exit code 表达可恢复错误，这里透传
         die(_reason_from_exit(proc.returncode), detail, proc.returncode or 1)
     try:
@@ -511,7 +511,7 @@ def _handoff(lexical: dict, reason: str, detail: str) -> dict:
             "name": lexical.get("targetName"),
             "confidence": lexical.get("confidence"),
         },
-        "hint": "用你自己的 LLM 在 candidates 里复核 bestGuess，或另选，然后 smac click --app A --ref R",
+        "hint": "用你自己的 LLM 在 candidates 里复核 bestGuess，或另选，然后 scu click --app A --ref R",
         "candidates": lexical["candidates"],
     }
 
@@ -666,7 +666,8 @@ def cmd_snapshot(args) -> int:
 
 EXIT_CODES = {
     "stale_ref": 5, "text_not_found": 6, "disabled": 7, "no_geometry": 8,
-    "app_not_found": 2, "no_window": 3, "ax_timeout": 9, "recipe_not_found": 2,
+    "app_not_found": 2, "no_window": 3, "ax_timeout": 9, "ax_cannot_complete": 10,
+    "recipe_not_found": 2,
 }
 
 
@@ -757,7 +758,7 @@ def cmd_do(args) -> int:
     if not decision.get("ok"):
         return out(decision, 2)
     if decision.get("tier") == "recipe":
-        die("recipe_tier", "命中 recipe，请用 smac recipe run", 3)
+        die("recipe_tier", "命中 recipe，请用 scu recipe run", 3)
     ref = decision.get("targetRef")
     if not ref:
         die("no_target", "决策没有给出目标", 6)
@@ -830,8 +831,8 @@ def cmd_bench(args) -> int:
 # ---------------------------------------------------------------- 入口
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="smac", description="stable-mac: 精准 macOS computer-use")
-    p.add_argument("--version", action="version", version=f"smac {VERSION}")
+    p = argparse.ArgumentParser(prog="scu", description="stable-computer-use: 精准 macOS computer-use")
+    p.add_argument("--version", action="version", version=f"scu {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor").set_defaults(fn=cmd_doctor)

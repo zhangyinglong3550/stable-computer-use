@@ -5,20 +5,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-echo "==> 构建 smac-ax"
+echo "==> 构建 scu-ax"
 ( cd runtime && swift build -c release )
 
 echo "==> 自检"
-./cli/smac doctor || {
+./cli/scu doctor || {
   echo "!! 权限没给全，先到 系统设置 → 隐私与安全性 → 辅助功能 勾选终端"
 }
 
 echo "==> 装 skill"
 for dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.cursor/skills" "$HOME/.agents/skills"; do
   [ -d "$(dirname "$dir")" ] || continue
-  mkdir -p "$dir/stable-mac"
-  cp skill/SKILL.md "$dir/stable-mac/SKILL.md"
-  echo "    $dir/stable-mac"
+  mkdir -p "$dir/stable-computer-use"
+  cp skill/SKILL.md "$dir/stable-computer-use/SKILL.md"
+  echo "    $dir/stable-computer-use"
 done
 
 cat <<TIP
@@ -26,7 +26,7 @@ cat <<TIP
 用起来（当前会话）：
 
   export PATH="\$PATH:$ROOT/cli"
-  smac doctor
-  smac snapshot --app Finder
+  scu doctor
+  scu snapshot --app Finder
 
 TIP

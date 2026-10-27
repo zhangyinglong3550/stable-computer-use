@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "smac-ax",
+    name: "scu-ax",
     platforms: [.macOS(.v13)],
     targets: [
         .executableTarget(
-            name: "smac-ax",
-            path: "Sources/smac-ax"
+            name: "scu-ax",
+            path: "Sources/scu-ax"
         )
     ]
 )

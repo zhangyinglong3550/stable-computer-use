@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""stable-mac 基准：延迟 + 端到端准确率。
+"""stable-computer-use 基准：延迟 + 端到端准确率。
 
 用法：
   python3 bench/run.py                 # 全部
@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SMAC = ROOT / "cli" / "smac"
+SMAC = ROOT / "cli" / "scu"
 
 # (app, 指令, 期望目标名字里的关键子串)
 # 指令是**改写过的自然说法**，不是元素标签原文 —— 这才反映真实用法
@@ -58,7 +58,7 @@ def run(argv: list[str]) -> tuple[dict, float]:
 
 
 def latency(apps: list[str], runs: int) -> None:
-    print("### 快照延迟（`smac snapshot`，含进程启动）\n")
+    print("### 快照延迟（`scu snapshot`，含进程启动）\n")
     print("| app | p50 | p95 | min | max |")
     print("|---|---|---|---|---|")
     for app in apps:
@@ -71,7 +71,7 @@ def latency(apps: list[str], runs: int) -> None:
 
 
 def accuracy(apps: list[str]) -> None:
-    print("### 端到端准确率（`smac decide --no-decider`，纯本地路径）\n")
+    print("### 端到端准确率（`scu decide --no-decider`，纯本地路径）\n")
     rows = []
     tier_count: dict[str, int] = {}
     hits = 0

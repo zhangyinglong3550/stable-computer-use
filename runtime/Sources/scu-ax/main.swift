@@ -38,11 +38,39 @@ func attr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
     return AXUIElementCopyAttributeValue(el, name as CFString, &v) == .success ? v : nil
 }
 
+/// 清洗不可见字符。
+///
+/// 实测真实 app 的窗口标题里塞满了这些（Chrome 的窗口标题前面就是一长串），
+/// 不清洗会污染渲染、模糊匹配和 token 计数。
+/// 用 Unicode 类别判定而不是列举码点：Cf 覆盖零宽空格、双向控制符、标签字符等，
+/// 比手写白名单可靠得多。
+func sanitize(_ s: String) -> String {
+    var out = String.UnicodeScalarView()
+    for sc in s.unicodeScalars {
+        switch sc.properties.generalCategory {
+        case .format, .control, .unassigned:
+            // 保留换行和制表，其余控制符换成空格
+            if sc == "\n" || sc == "\t" { out.append(sc) } else { out.append(" ") }
+        case .nonspacingMark:
+            // 变体选择符（FE00–FE0F）是 nonspacingMark，去掉；组合附加符号保留
+            if (0xFE00...0xFE0F).contains(sc.value) || (0xE0100...0xE01EF).contains(sc.value) {
+                continue
+            }
+            out.append(sc)
+        default:
+            out.append(sc)
+        }
+    }
+    var text = String(out).trimmingCharacters(in: .whitespacesAndNewlines)
+    // 收敛连续空格
+    while text.contains("  ") { text = text.replacingOccurrences(of: "  ", with: " ") }
+    return text
+}
+
 func asText(_ v: Any?) -> String? {
     guard let v else { return nil }
     if let s = v as? String {
-        let t = s.replacingOccurrences(of: "\u{0000}", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = sanitize(s)
         return t.isEmpty ? nil : t
     }
     if let n = v as? NSNumber { return n.stringValue }
@@ -307,13 +335,11 @@ func targetWindow(_ a: AppRef) -> AXUIElement {
         if let f = ws.first(where: { isWindow($0) }) { return f }
     }
     let name = a.app.localizedName ?? "?"
-    // 区分"真的没窗口"和"AX 不给数据"
-    let sys = AXUIElementCreateSystemWide()
-    AXUIElementSetMessagingTimeout(sys, 1.0)
+    // 区分"真的没窗口"和"AX 根本读不到"：对 app 自己读一次角色
     var probe: CFTypeRef?
-    let probeErr = AXUIElementCopyAttributeValue(sys, kAXFocusedApplicationAttribute as CFString, &probe)
+    let probeErr = AXUIElementCopyAttributeValue(a.ax, kAXRoleAttribute as CFString, &probe)
     if probeErr == .cannotComplete {
-        die("ax_cannot_complete: AX 返回 -25204，屏幕可能已锁定或不是活动 GUI 会话", code: 10)
+        die("ax_cannot_complete: AX 返回 -25204，可能是屏幕锁定、显示器休眠或 AX 服务无响应", code: 10)
     }
     die("no_window: \(name) 没有可操作的窗口（可能只有桌面，或被最小化）", code: 3)
 }
@@ -550,7 +576,7 @@ func centerOf(_ nodes: [Node], _ i: Int, keep: [Bool]) -> CGPoint? {
 
 let args = Args(Array(CommandLine.arguments.dropFirst()))
 guard let cmd = args.positional.first else {
-    die("usage: smac-ax <doctor|apps|snapshot|act|verify> [options]", code: 1)
+    die("usage: scu-ax <doctor|apps|snapshot|act|verify> [options]", code: 1)
 }
 
 switch cmd {
@@ -559,20 +585,28 @@ case "doctor":
     let trusted = AXIsProcessTrusted()
     let screen = CGPreflightScreenCaptureAccess()
 
-    // AXIsProcessTrusted() == true **不代表真的能读**。
-    // 实测：TCC 显示已授权，但 AX 服务会给 -25204（kAXErrorCannotComplete），
-    // 常见于锁屏 / 非当前 GUI 会话 / AX 服务状态异常。必须做一次真实探针。
-    let sys = AXUIElementCreateSystemWide()
-    AXUIElementSetMessagingTimeout(sys, 1.5)
-    var probe: CFTypeRef?
-    let probeErr = AXUIElementCopyAttributeValue(
-        sys, kAXFocusedApplicationAttribute as CFString, &probe)
-    let axUsable = (probeErr == .success && probe != nil)
+    // AXIsProcessTrusted() == true **不代表真的能读**，必须做一次真实探针。
+    //
+    // 注意：不要用 AXUIElementCreateSystemWide() + kAXFocusedApplicationAttribute
+    // 做探针 —— 实测在正常工作时它也会稳定返回 -25204，是假阴性。
+    // 正确做法是对**某个具体 app** 读一次属性。
+    var axUsable = false
+    var probeErr: AXError = .cannotComplete
+    var probeTarget = "-"
+    if let front = NSWorkspace.shared.frontmostApplication {
+        probeTarget = front.bundleIdentifier ?? front.localizedName ?? "?"
+        let ax = AXUIElementCreateApplication(front.processIdentifier)
+        AXUIElementSetMessagingTimeout(ax, 1.5)
+        var probe: CFTypeRef?
+        probeErr = AXUIElementCopyAttributeValue(ax, kAXRoleAttribute as CFString, &probe)
+        axUsable = (probeErr == .success && probe != nil)
+    }
 
     var payload: [String: Any] = [
         "accessibility": trusted,
         "accessibilityUsable": axUsable,
         "axProbeCode": Int(probeErr.rawValue),
+        "axProbeTarget": probeTarget,
         "screen_recording": screen,
         "macos": ProcessInfo.processInfo.operatingSystemVersionString,
         "ok": trusted && axUsable,

@@ -8,8 +8,8 @@
 
 ## 目录
 
-- `cli/smac` — 单文件 Python CLI，**只用标准库**。不要引入第三方依赖。
-- `runtime/Sources/smac-ax/main.swift` — Swift，负责 AX 遍历、ref 计算、输入合成。
+- `cli/scu` — 单文件 Python CLI，**只用标准库**。不要引入第三方依赖。
+- `runtime/Sources/scu-ax/main.swift` — Swift，负责 AX 遍历、ref 计算、输入合成。
 - `bench/run.py` — 延迟与准确率基准。改性能后必须重跑，数字写进 README。
 - `skill/SKILL.md` — 给 Agent 的一页说明书。改命令必须同步改这里。
 
@@ -27,8 +27,12 @@
 
 ```bash
 cd runtime && swift build -c release && cd ..
-./cli/smac doctor
+./scripts/test.sh
+./cli/scu doctor
 python3 bench/run.py --runs 10
 ```
 
-三个都要过。bench 数字变了就更新 README 里的表格。
+全都要过。bench 数字变了就更新 README 里的表格。
+
+集成测试在 AX 不可用时自动跳过 —— 跳过不等于通过，本地提交前请确认 `scu doctor`
+的 `accessibilityUsable` 是 `true`，让集成测试真的跑起来。

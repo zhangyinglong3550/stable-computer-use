@@ -1,4 +1,4 @@
-# stable-mac
+# stable-computer-use
 
 给任意 AI Agent 用的 **macOS 精准 computer-use**。读无障碍树（AX），给每个元素一个**跨快照稳定的 ref**，按 ref 操作。
 
@@ -17,7 +17,7 @@ Agent 要操作桌面 app，主流做法是「截图 → 模型看像素 → 输
 - **不准**：Retina 缩放、多屏、窗口移动后坐标全废
 - **慢**：每一步都要过一次模型
 
-stable-mac 换成另一条路：**读 AX 树，按元素操作**。
+stable-computer-use 换成另一条路：**读 AX 树，按元素操作**。
 
 ```
 [3netay] Button: 搜索  <AXPress>
@@ -33,13 +33,13 @@ stable-mac 换成另一条路：**读 AX 树，按元素操作**。
 
 ### 1. 快照快到不值得优化
 
-`smac snapshot` 端到端（含进程启动）：
+`scu snapshot` 端到端（含进程启动）：
 
 | app | p50 | p95 |
 |---|---|---|
-| Finder | **105 ms** | 117 ms |
-| Chrome | **79 ms** | 97 ms |
-| 飞书 | **51 ms** | 71 ms |
+| Finder | **92 ms** | 115 ms |
+| Chrome | **41 ms** | 55 ms |
+| 飞书 | **51 ms** | 64 ms |
 
 其中 AX 遍历用**批量属性读**（一次 IPC 拿全部属性，而不是每个属性一次往返），比逐属性读快 **3 倍**：
 
@@ -66,7 +66,7 @@ Chrome  逐属性  44.0ms → 批量 16.7ms   (2.63x)
 每一级都**如实报告自己在第几级、置信度多少**：
 
 ```bash
-$ smac decide --app com.apple.finder --goal '点击"搜索"'
+$ scu decide --app com.apple.finder --goal '点击"搜索"'
 {"ok": true, "tier": "exact", "targetRef": "3netay", "targetName": "搜索",
  "confidence": 1.0, "confidenceGate": "high", "recommendedAction": "act"}
 ```
@@ -75,17 +75,17 @@ $ smac decide --app com.apple.finder --goal '点击"搜索"'
 
 ```bash
 # 第一次：本地打分说不准 → 走 JEV 或交给你自己的 LLM
-$ smac decide --app com.apple.finder --goal "回到上一个文件夹"
+$ scu decide --app com.apple.finder --goal "回到上一个文件夹"
 {"ok": false, "tier": "handoff", "confidence": 0.149,
  "bestGuess": {"ref": "3akzfa", "name": "共享文件夹"},
  "candidates": [ ... ]}
 
 # 你选对了，告诉它一次
-$ smac remember --app com.apple.finder --goal "回到上一个文件夹" --ref mkq0ob
+$ scu remember --app com.apple.finder --goal "回到上一个文件夹" --ref mkq0ob
 {"ok": true, "remembered": {"goal": "回到上一个文件夹", "ref": "mkq0ob", "name": "返回"}}
 
 # 之后：零模型、98ms
-$ smac decide --app com.apple.finder --goal "回到上一个文件夹"
+$ scu decide --app com.apple.finder --goal "回到上一个文件夹"
 {"ok": true, "tier": "memory", "targetName": "返回", "confidence": 0.99}
 ```
 
@@ -97,18 +97,22 @@ JEV 高置信命中时也会**自动写进记忆**，不需要手动 remember。
 
 17 条**改写过的中文指令**（不是元素标签原文），纯本地路径：
 
-- **top-1 准确率 14/17 = 82.4%**（冷启动，无记忆）
-- 高置信（gate=high）的判定 **5/5 全部正确**（样本小，但趋势明确）
+- **top-1 准确率 13/17 = 76.5%**（冷启动，无记忆）
+- 高置信（gate=high）的判定 **全部正确**（样本小，但趋势明确）
 - 本地打分耗时 **中位 0.5 ms**
 
-失败的 2 条都是纯语义缺口：
+失败的 4 条全是语义缺口，且**全部被如实标成 `gate=low/medium`**：
 
 | 指令 | 正确 | 选中 |
 |---|---|---|
-| 往前面走一页 | 前进 | 群组（conf 0.0，如实报低） |
-| 搜一下文件 | 搜索 | 共享文件夹（conf 0.10，如实报低） |
+| 回到上一个文件夹 | 返回 | 共享文件夹（conf 0.15） |
+| 往前面走一页 | 前进 | 群组（conf 0.0） |
+| 搜一下文件 | 搜索 | 共享文件夹（conf 0.10） |
+| 点击"编辑标签" | 编辑标签 | 标签（conf 0.21） |
 
-注意：85% 左右的准确率里，只有少数是**高置信**的，其余虽然猜对了但 `gate` 是 low，会被交给下一级。这是故意的 —— 猜对但不敢确定，不如交出去。
+注意：76% 里只有少数是**高置信**的，其余虽然猜对了但 `gate` 是 low，会被交给下一级。这是故意的 —— 猜对但不敢确定，不如交出去。
+
+准确率会随窗口内容变化（同一条指令在不同 Finder 视图下结果不同），所以请以**你自己机器上跑出来的数字**为准。
 
 **这是刻意设计的**：本地打分不追求全对，它负责「高置信直接执行、低置信如实上报」。剩下的交给 JEV 或你的 LLM。诚实地上报不确定，比假装确定有用得多。
 
@@ -118,7 +122,7 @@ JEV 高置信命中时也会**自动写进记忆**，不需要手动 remember。
 python3 bench/run.py
 ```
 
-**先跑 `smac doctor`**：`accessibilityUsable` 必须是 `true`。只是 `accessibility: true` 不够 —— 见下面的已知限制。
+**先跑 `scu doctor`**：`accessibilityUsable` 必须是 `true`。只是 `accessibility: true` 不够 —— 见下面的已知限制。
 
 ---
 
@@ -127,10 +131,10 @@ python3 bench/run.py
 前置：macOS 13+、Xcode Command Line Tools、Python 3.8+。
 
 ```bash
-git clone https://github.com/zhangyinglong3550/stable-mac
-cd stable-mac
+git clone https://github.com/zhangyinglong3550/stable-computer-use
+cd stable-computer-use
 cd runtime && swift build -c release && cd ..
-./cli/smac doctor
+./cli/scu doctor
 ```
 
 `doctor` 里 `accessibility` 必须是 `true`。不是的话：**系统设置 → 隐私与安全性 → 辅助功能**，勾选你的终端（Terminal / iTerm / VS Code）。
@@ -146,31 +150,31 @@ cd runtime && swift build -c release && cd ..
 ## 命令
 
 ```bash
-smac doctor                                  # 权限与二进制自检
-smac apps                                    # 列出有窗口的 app
-smac snapshot --app Finder                   # AX 树，带稳定 ref
-smac snapshot --app Finder --json            # 同上，结构化
+scu doctor                                  # 权限与二进制自检
+scu apps                                    # 列出有窗口的 app
+scu snapshot --app Finder                   # AX 树，带稳定 ref
+scu snapshot --app Finder --json            # 同上，结构化
 
-smac click --app Finder --ref 3netay         # 按 ref 点击（推荐）
-smac click --app Finder --text "搜索"        # 按名字点击
-smac click --app Finder --ref R --via ax     # 走 AXPress，不动鼠标、不抢焦点
-smac type  --app TextEdit --text "hello"
-smac key   --app Finder --key "super+n"
-smac scroll --app Safari --ref R --direction down --pages 2
-smac set   --app TextEdit --ref R --value "全文替换"
+scu click --app Finder --ref 3netay         # 按 ref 点击（推荐）
+scu click --app Finder --text "搜索"        # 按名字点击
+scu click --app Finder --ref R --via ax     # 走 AXPress，不动鼠标、不抢焦点
+scu type  --app TextEdit --text "hello"
+scu key   --app Finder --key "super+n"
+scu scroll --app Safari --ref R --direction down --pages 2
+scu set   --app TextEdit --ref R --value "全文替换"
 
-smac verify --app Finder --ref 3netay        # 执行前校验：还在吗？可点吗？位置在哪？
-smac shot  --app Finder --out /tmp/f.png     # 窗口矩形截图
+scu verify --app Finder --ref 3netay        # 执行前校验：还在吗？可点吗？位置在哪？
+scu shot  --app Finder --out /tmp/f.png     # 窗口矩形截图
 
-smac decide --app Finder --goal '点击"搜索"'
-smac do     --app Finder --goal '点击"搜索"'  # decide + act 一次做完
-smac remember --app Finder --goal G --ref R  # 教它一次，下次零成本
+scu decide --app Finder --goal '点击"搜索"'
+scu do     --app Finder --goal '点击"搜索"'  # decide + act 一次做完
+scu remember --app Finder --goal G --ref R  # 教它一次，下次零成本
 
-smac recipe save NAME < steps.json
-smac recipe run  NAME --app Finder
-smac recipe list
+scu recipe save NAME < steps.json
+scu recipe run  NAME --app Finder
+scu recipe list
 
-smac bench --app Finder --runs 20
+scu bench --app Finder --runs 20
 ```
 
 所有命令输出 JSON，带统一的 `reasonCode` 和 exit code。
@@ -228,10 +232,10 @@ export TYPESAFE_API_KEY=...
 | 限制 | 说明 |
 |---|---|
 | **Electron app 可能没有 AX 树** | 飞书、Sublime 有时 `AXWindows` 返回 0 个窗口。需要 app 自己打开 `AXManualAccessibility`。兜底是截图 + 坐标 |
-| **矩形截图会串窗口** | `smac shot` 用 `screencapture -R`，盖在目标窗口上的其他窗口会被拍进去。跨 Space / 多屏时可能拍到别的内容。需要纯净窗口图得走 ScreenCaptureKit（要一个 .app 上下文） |
+| **矩形截图会串窗口** | `scu shot` 用 `screencapture -R`，盖在目标窗口上的其他窗口会被拍进去。跨 Space / 多屏时可能拍到别的内容。需要纯净窗口图得走 ScreenCaptureKit（要一个 .app 上下文） |
 | **无文字容器排最后** | 兜底候选优先给有文字的元素，纯图标按钮可能选不中，用 ref 或坐标 |
 | **鼠标点击需要窗口在前台** | `--via ax` 可以不动鼠标不抢焦点，但不是所有控件都支持 AXPress |
-| **`AXIsProcessTrusted()` 会骗人** | 它返回 `true` 不代表真能读。实测遇到过：TCC 显示已授权，但 AX 返回 `-25204`（cannotComplete），`kAXWindowsAttribute` 把 app 元素本身当成"窗口"返回。常见于**屏幕锁定**或**非活动 GUI 会话**。`smac doctor` 会做真实探针，`accessibilityUsable` 才是可信的 |
+| **`AXIsProcessTrusted()` 会骗人** | 它返回 `true` 不代表真能读。实测遇到过：TCC 显示已授权，但 AX 返回 `-25204`（cannotComplete），`kAXWindowsAttribute` 把 app 元素本身当成"窗口"返回。常见于**屏幕锁定**或**非活动 GUI 会话**。`scu doctor` 会做真实探针，`accessibilityUsable` 才是可信的 |
 | 窗口最小化 / 在别的 Space 时可能取不到 | 这时返回 `no_window`，不是崩溃。先把窗口调出来 |
 | **只做 macOS** | 别的平台 AX/UIA 语义差太多，硬套一个抽象是负担 |
 
@@ -239,7 +243,7 @@ export TYPESAFE_API_KEY=...
 
 ## 与其它项目的关系
 
-这个赛道已经很挤，stable-mac 的差异点只有两个：**公开延迟基准**和**六级快路径 + 记忆**。
+这个赛道已经很挤，stable-computer-use 的差异点只有两个：**公开延迟基准**和**六级快路径 + 记忆**。
 
 | 项目 | 差异 |
 |---|---|
@@ -255,26 +259,40 @@ export TYPESAFE_API_KEY=...
 ## 开发
 
 ```
-cli/smac                     单文件 Python CLI（纯标准库）
-runtime/Sources/smac-ax/     Swift AX 助手（批量读、稳定 ref、输入合成）
+cli/scu                     单文件 Python CLI（纯标准库）
+runtime/Sources/scu-ax/     Swift AX 助手（批量读、稳定 ref、输入合成）
 skill/SKILL.md               给 Agent 的一页说明书
 bench/run.py                 延迟 + 准确率基准
 docs/design.md               设计取舍与实测数据
 ```
 
-测试：
+### 测试
 
 ```bash
-cd runtime && swift build -c release && cd ..
-./cli/smac doctor
-python3 bench/run.py --runs 10
+./scripts/test.sh
+```
+
+分两层：
+
+| 层 | 文件 | 需要权限 | 说明 |
+|---|---|---|---|
+| 单元 | `tests/test_unit.py` | ❌ | 26 条，覆盖文本清洗、打分器（含"预筛绝不返空"回归）、置信度、记忆、exit code |
+| 集成 | `tests/test_integration.py` | ✅ | 14 条，真读 AX：ref 唯一性与跨快照稳定性、零宽字符清洗、target_ref 可解析、verify、decide 各层、记忆闭环、截图 |
+
+集成测试在 AX 不可用（没授权 / 锁屏 / 显示器休眠）时**整体跳过而不是失败**，所以 CI 里也不会红。
+
+单独跑：
+
+```bash
+python3 tests/test_unit.py
+python3 tests/test_integration.py
 ```
 
 ---
 
 ## English
 
-**stable-mac** gives any AI agent precise macOS computer-use by reading the
+**stable-computer-use** gives any AI agent precise macOS computer-use by reading the
 accessibility tree instead of pixels. Every element gets a **stable ref**
 (a hash of its ancestor path, not an array index), and actions reference that ref.
 
@@ -290,7 +308,7 @@ accessibility tree instead of pixels. Every element gets a **stable ref**
   your own LLM.
 
 Requires macOS 13+, Xcode CLT, Python 3.8+. Grant Accessibility permission to
-your terminal, then `./cli/smac doctor`.
+your terminal, then `./cli/scu doctor`.
 
 ---
 

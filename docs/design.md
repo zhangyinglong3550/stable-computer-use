@@ -48,13 +48,13 @@
 
 ## 3. 端到端延迟预算
 
-`smac snapshot`（含 Python 进程启动与 Swift 子进程启动）：
+`scu snapshot`（含 Python 进程启动与 Swift 子进程启动）：
 
 | app | p50 | p95 | 节点数 |
 |---|---|---|---|
-| Finder | 104.9 ms | 117.3 ms | ~150 |
-| Chrome | 78.7 ms | 96.5 ms | ~54 |
-| 飞书 | 50.5 ms | 70.7 ms | ~52 |
+| Finder | 92.3 ms | 115.3 ms | ~150 |
+| Chrome | 40.8 ms | 55.3 ms | ~54 |
+| 飞书 | 50.7 ms | 64.3 ms | ~52 |
 
 拆开看：
 
@@ -131,8 +131,8 @@ handoff → 返回候选表，交回调用方                    0 成本
 
 17 条**改写过的中文指令**（不是元素标签原文），纯本地路径：
 
-- top-1 **14/17 = 82.4%**（冷启动，无记忆）
-- 高置信判定 **5/5 正确**
+- top-1 **13/17 = 76.5%**（冷启动，无记忆）
+- 高置信判定全部正确
 - 耗时 **中位 0.5 ms**
 
 失败样例：
@@ -141,6 +141,8 @@ handoff → 返回候选表，交回调用方                    0 成本
 |---|---|---|---|
 | 往前面走一页 | 前进 | 群组 | "前面" vs "前进" 只有单字重叠 |
 | 搜一下文件 | 搜索 | 共享文件夹 | 被"文件"带偏 |
+| 回到上一个文件夹 | 返回 | 共享文件夹 | 零字面重叠 |
+| 点击"编辑标签" | 编辑标签 | 标签 | 该视图下没有精确叫"编辑标签"的节点 |
 
 这两条都被如实标成 `gate=low`，会升级到 JEV 或交回调用方 —— 这正是设计意图。
 
@@ -219,7 +221,7 @@ Assertion failed: (did_initialize), function CGS_REQUIRE_INIT
 ```bash
 cd runtime && swift build -c release && cd ..
 python3 bench/run.py --runs 10
-./cli/smac bench --app com.apple.finder --runs 20
+./cli/scu bench --app com.apple.finder --runs 20
 ```
 
 批量 vs 逐属性的对比需要手工验证（`AXUIElementCopyMultipleAttributeValues` 的 A/B）。本项目当前只保留了批量实现。
