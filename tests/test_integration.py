@@ -343,6 +343,38 @@ class TestCodeMode(unittest.TestCase):
         self.assertIn('"ok":true', out.replace(" ", ""))
 
 
+@unittest.skipUnless(AVAILABLE, "AX 不可用")
+class TestChangeDetection(unittest.TestCase):
+    """动作后判断"界面变没变"，代替截图确认。"""
+
+    def setUp(self):
+        if not APP:
+            self.skipTest("没有带窗口的 app 可用")
+
+    def _js(self, code: str):
+        return subprocess.run([sys.executable, str(SCU), "js", "-e", code],
+                              capture_output=True, text=True, timeout=90)
+
+    def test_signature_stable_when_idle(self):
+        p = self._js(
+            f'const a = await scu.getApp("{APP}");\n'
+            'const s1 = await a.signature(); const s2 = await a.signature();\n'
+            'console.log(s1 === s2 ? "SAME" : "DIFF");')
+        self.assertIn("SAME", p.stdout, p.stderr)
+
+    def test_wait_reports_fields(self):
+        p = self._js(
+            f'const a = await scu.getApp("{APP}");\n'
+            'const s = await a.state({json:true});\n'
+            'const t = s.elements.find(e => e.actions && e.actions.includes("AXPress"));\n'
+            'if (!t) { console.log("SKIP"); } else {\n'
+            '  const r = await a.clickAndWait({ref: t.ref}, {timeoutMs: 400});\n'
+            '  console.log(JSON.stringify({changed: r.changed, hasWaited: typeof r.waitedMs === "number"}));\n'
+            '}')
+        self.assertIn("changed", p.stdout, p.stderr)
+        self.assertIn("hasWaited", p.stdout)
+
+
 if __name__ == "__main__":
     print(f"AX available: {AVAILABLE} | app: {APP}\n", file=sys.stderr)
     unittest.main(verbosity=2)

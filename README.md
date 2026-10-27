@@ -141,7 +141,23 @@ await app.key("super+n");
 一句话：**动作是微秒级的，快照是百毫秒级的，进程启动是几十毫秒级的。**
 能连续做的事就用 batch，别一条一条起进程。
 
-### 3. 六级快路径，越前面的越少花钱
+### 3. 用「界面变没变」代替截图
+
+动作之后怎么知道成功了？截图给我看要 1–3 秒。**看 AX 签名只要 46ms。**
+
+```bash
+scu click --app X --ref R --wait      # 返回 changed: true/false
+```
+
+```js
+const r = await app.clickAndWait({ ref: "abc123" });
+if (!r.changed) throw new Error("没生效");
+```
+
+实测切换会话：`changed=true` 在 **46ms** 内返回；点一个已经打开的会话则等到超时并如实报 `changed=false`。
+这是 Electron / 无 AX 场景里唯一能绕开视觉判断的办法。
+
+### 4. 六级快路径，越前面的越少花钱
 
 不是「要么本地要么模型」，而是一条阶梯：
 

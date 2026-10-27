@@ -776,6 +776,18 @@ def _act(args, op: str, extra: list[str]) -> int:
         req["value"] = flat["value"]
     if "x" in flat and "y" in flat:
         req["x"], req["y"] = float(flat["x"]), float(flat["y"])
+        if flat.get("via") == "mouse":
+            req["mouse"] = True
+
+    # --wait：动作 + 等界面变化，一步到位（避免截图确认）
+    if flat.get("wait"):
+        # 真鼠标仍然要显式授权，别绕过安全契约
+        if flat.get("via") == "mouse" and not flat.get("take-over"):
+            die("needs_takeover", "真鼠标点击会打断用户，需要 --take-over", 11)
+        req["timeoutMs"] = int(flat.get("wait-timeout") or 1500)
+        fast = dcall({**req, "cmd": "actAndWait"})
+        if fast is not None:
+            return out(fast, exit_for(fast))
 
     fast_only = op in ("click", "set", "type") and not flat.get("via") == "mouse" \
         and not flat.get("take-over")
@@ -807,6 +819,8 @@ def cmd_click(args) -> int:
     for k, v in (("via", args.via), ("button", args.button), ("count", args.count)):
         if v:
             extra += [f"--{k}", str(v)]
+    if args.wait:
+        extra += ["--wait", "--wait-timeout", str(args.wait_timeout)]
     if args.take_over:
         extra += ["--take-over", "--idle-seconds", str(args.idle_seconds)]
     return _act(args, "click", extra)
@@ -816,6 +830,8 @@ def cmd_type(args) -> int:
     extra = ["--text", args.text]
     if args.ref:
         extra += ["--ref", args.ref]
+    if args.wait:
+        extra += ["--wait", "--wait-timeout", str(args.wait_timeout)]
     if args.take_over:
         extra += ["--take-over", "--idle-seconds", str(args.idle_seconds)]
     return _act(args, "type", extra)
@@ -823,6 +839,8 @@ def cmd_type(args) -> int:
 
 def cmd_key(args) -> int:
     extra = ["--key", args.key, "--via", args.via]
+    if args.wait:
+        extra += ["--wait", "--wait-timeout", str(args.wait_timeout)]
     if args.take_over:
         extra += ["--take-over", "--idle-seconds", str(args.idle_seconds)]
     return _act(args, "key", extra)
@@ -1077,6 +1095,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ax=走无障碍动作（不动鼠标、不抢焦点，默认）；mouse=合成鼠标事件")
     c.add_argument("--button", choices=["left", "right"])
     c.add_argument("--count", type=int)
+    c.add_argument("--wait", action="store_true",
+                   help="动作后等界面变化（返回 changed），代替截图确认")
+    c.add_argument("--wait-timeout", type=int, default=1500)
     c.add_argument("--take-over", action="store_true",
                    help="明确授权接管前台（会打断用户）。仅在 --via mouse 或键盘输入时需要")
     c.add_argument("--idle-seconds", type=float, default=2.0,
@@ -1087,6 +1108,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--app", required=True)
     t.add_argument("--text", required=True)
     t.add_argument("--ref", help="目标输入框的 ref（不给则用该 app 的焦点元素）")
+    t.add_argument("--wait", action="store_true", help="动作后等界面变化")
+    t.add_argument("--wait-timeout", type=int, default=1500)
     t.add_argument("--take-over", action="store_true",
                    help="AX 写不进去时，授权切到前台用真键盘输入")
     t.add_argument("--idle-seconds", type=float, default=2.0)
@@ -1097,6 +1120,8 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--key", required=True)
     k.add_argument("--via", default="ax", choices=["ax", "mouse"],
                    help="ax=先查菜单栏（后台可触发）；mouse=真键盘，需要接管前台")
+    k.add_argument("--wait", action="store_true", help="动作后等界面变化")
+    k.add_argument("--wait-timeout", type=int, default=1500)
     k.add_argument("--take-over", action="store_true")
     k.add_argument("--idle-seconds", type=float, default=2.0)
     k.set_defaults(fn=cmd_key)
@@ -1106,6 +1131,8 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--ref", required=True)
     sc.add_argument("--direction", default="down", choices=["up", "down", "left", "right"])
     sc.add_argument("--pages", type=float, default=1.0)
+    sc.add_argument("--wait", action="store_true")
+    sc.add_argument("--wait-timeout", type=int, default=1500)
     sc.add_argument("--take-over", action="store_true")
     sc.add_argument("--idle-seconds", type=float, default=2.0)
     sc.set_defaults(fn=cmd_scroll)

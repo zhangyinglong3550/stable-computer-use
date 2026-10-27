@@ -109,6 +109,42 @@ class App {
     return r;
   }
 
+  /**
+   * 动作 + 等界面变化，一步到位。
+   * 返回 { ok, changed, waitedMs } —— changed=false 说明动作可能没生效。
+   * 这是替代「动作后截图给模型看」的关键：30-120ms 的遍历 vs 1-3s 的视觉判断。
+   */
+  async clickAndWait(target, opts = {}) {
+    if (typeof target === "string") target = { ref: target };
+    const r = await rpc({
+      cmd: "actAndWait", app: this.name, timeoutMs: opts.timeoutMs ?? 1500, ...target,
+    });
+    if (r.ok === false) throw new Error(`clickAndWait failed: ${r.reasonCode}`);
+    return r;
+  }
+
+  async typeAndWait(text, opts = {}) {
+    const r = await rpc({
+      cmd: "actAndWait", app: this.name, text, timeoutMs: opts.timeoutMs ?? 1200,
+    });
+    if (r.ok === false) throw new Error(`typeAndWait failed: ${r.reasonCode}`);
+    return r;
+  }
+
+  async keyAndWait(chord, opts = {}) {
+    const r = await rpc({
+      cmd: "actAndWait", app: this.name, key: chord, timeoutMs: opts.timeoutMs ?? 1500,
+    });
+    if (r.ok === false) throw new Error(`keyAndWait failed: ${r.reasonCode}`);
+    return r;
+  }
+
+  async signature() {
+    const r = await rpc({ cmd: "signature", app: this.name });
+    if (r.ok === false) throw new Error(`signature failed: ${r.reasonCode}`);
+    return r.signature;
+  }
+
   async set(ref, value) {
     const r = await rpc({ cmd: "set", app: this.name, ref, value });
     if (!r.ok) throw new Error(`set failed: ${r.reasonCode}`);

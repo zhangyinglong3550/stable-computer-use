@@ -869,6 +869,103 @@ func writeLine(_ fd: Int32, _ obj: [String: Any]) {
     }
 }
 
+/// 界面指纹：只看留下来的节点的 ref/文字/值/可用性。
+/// 用来判断"动作之后界面到底变没变"，从而避免截图。
+func signature(_ s: Snapshot) -> String {
+    var h: UInt64 = 0xcbf2_9ce4_8422_2325
+    for i in s.nodes.indices where s.keep[i] {
+        let n = s.nodes[i]
+        let part = n.ref + "|" + (n.label ?? "") + "|" + (n.value ?? "") + "|" + (n.enabled ? "1" : "0")
+        for ch in part.utf8 {
+            h ^= UInt64(ch)
+            h = h &* 0x1000_0000_01b3
+        }
+    }
+    return base36(h, width: 12)
+}
+
+/// 执行一个动作，然后轮询直到界面变化（或超时）。
+/// 这是替代"动作后截图给模型看"的关键原语：一次遍历 30–120ms，比一次视觉判断快一个数量级。
+func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [String: Any] {
+    guard let before = snapshot(appSpec) else {
+        return ["ok": false, "reasonCode": "no_window", "app": appSpec]
+    }
+    cacheStore(before)
+    let sigBefore = signature(before)
+
+    // ---- 执行 ----
+    var actResult: [String: Any] = ["ok": true]
+    if let ref = req["ref"] as? String {
+        actResult = cachedPress(ref)
+        if (actResult["reasonCode"] as? String) == "cache_miss" {
+            if let fresh = snapshot(appSpec) { cacheStore(fresh) }
+            actResult = cachedPress(ref)
+        }
+    } else if let x = req["x"] as? Double, let y = req["y"] as? Double {
+        if (req["mouse"] as? Bool) == true {
+            guard let app = resolveAppSafe(appSpec) else {
+                return ["ok": false, "reasonCode": "app_not_found"]
+            }
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
+                activate(app)
+            }
+            mouseClick(at: CGPoint(x: x, y: y), count: (req["count"] as? Int) ?? 1)
+            actResult = ["ok": true, "via": "mouse"]
+        } else {
+            guard let app = resolveAppSafe(appSpec), let hit = elementAtPoint(app.app.processIdentifier, CGPoint(x: x, y: y)),
+                  let t = pressable(hit) else {
+                return ["ok": false, "reasonCode": "no_ax_action_at_point"]
+            }
+            let err = AXUIElementPerformAction(t.element, t.action as CFString)
+            actResult = ["ok": err == .success, "via": "hit-test", "action": t.action]
+        }
+    } else if let text = req["text"] as? String {
+        guard let app = resolveAppSafe(appSpec) else {
+            return ["ok": false, "reasonCode": "app_not_found"]
+        }
+        var f: CFTypeRef?
+        if AXUIElementCopyAttributeValue(app.ax, kAXFocusedUIElementAttribute as CFString, &f) == .success,
+           let el = f as! AXUIElement?, writeText(into: el, text) {
+            actResult = ["ok": true, "via": "ax"]
+        } else {
+            return ["ok": false, "reasonCode": "needs_takeover"]
+        }
+    } else if let k = req["key"] as? String {
+        guard let app = resolveAppSafe(appSpec) else {
+            return ["ok": false, "reasonCode": "app_not_found"]
+        }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
+            activate(app)
+        }
+        pressKey(k)
+        actResult = ["ok": true, "via": "keyboard"]
+    } else {
+        return ["ok": false, "reasonCode": "bad_args"]
+    }
+
+    // ---- 等变化 ----
+    let started = Date()
+    var changed = false
+    var waited = 0
+    while waited < timeoutMs {
+        usleep(45_000)
+        waited = Int(Date().timeIntervalSince(started) * 1000)
+        guard let now = snapshot(appSpec) else { continue }
+        if signature(now) != sigBefore {
+            cacheStore(now)
+            changed = true
+            break
+        }
+    }
+
+    var out = actResult
+    out["changed"] = changed
+    out["waitedMs"] = waited
+    out["before"] = sigBefore
+    if !changed { out["note"] = "界面没有变化：动作可能没生效，或者这个动作本来就不改界面" }
+    return out
+}
+
 func handleClient(_ fd: Int32) {
     var buf = [UInt8]()
     var tmp = [UInt8](repeating: 0, count: 65536)
@@ -971,6 +1068,16 @@ func handleClient(_ fd: Int32) {
         } else {
             writeLine(fd, ["ok": false, "reasonCode": "needs_takeover"])
         }
+
+    case "actAndWait":
+        let timeout = (req["timeoutMs"] as? Int) ?? 1500
+        writeLine(fd, actAndWait(req, appSpec: appSpec, timeoutMs: timeout))
+
+    case "signature":
+        guard let snap = snapshot(appSpec) else {
+            writeLine(fd, ["ok": false, "reasonCode": "no_window"]); return
+        }
+        writeLine(fd, ["ok": true, "signature": signature(snap)])
 
     case "activate":
         guard let app = resolveAppSafe(appSpec) else {
