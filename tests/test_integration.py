@@ -210,6 +210,58 @@ class TestDecide(unittest.TestCase):
 
 
 @unittest.skipUnless(AVAILABLE, "AX 不可用")
+class TestNonIntrusive(unittest.TestCase):
+    """核心契约：默认不激活目标 app、不移动鼠标、不抢焦点。"""
+
+    def setUp(self):
+        if not APP:
+            self.skipTest("没有带窗口的 app 可用")
+
+    def _mouse(self) -> tuple:
+        out = subprocess.run(
+            ["swift", "-e", "import Cocoa; print(\(NSEvent.mouseLocation.x)),\(NSEvent.mouseLocation.y))"],
+            capture_output=True, text=True, timeout=120)
+        try:
+            return tuple(round(float(v), 1) for v in out.stdout.strip().split(","))
+        except Exception:
+            self.skipTest("拿不到鼠标位置")
+
+    def test_hit_test_click_does_not_move_mouse(self):
+        d, _ = run("snapshot", "--app", APP, "--json")
+        els = d.get("elements") or []
+        if not els or not els[0].get("rect"):
+            self.skipTest("拿不到窗口几何")
+        r = els[0]["rect"]
+        # 窗口顶部 12px：几乎不可能有可执行元素，正好用来验证"失败但不打扰"
+        xy = f"{int(r['x'] + r['w'] / 2)},{int(r['y'] + 12)}"
+        before = self._mouse()
+        run("click", "--app", APP, "--xy", xy)
+        after = self._mouse()
+        self.assertEqual(before, after, "命中测试点击不应该移动鼠标")
+
+    def test_takeover_requires_explicit_opt_in(self):
+        """不显式 --take-over 时，抢焦点的路径必须拒绝。"""
+        d, code = run("click", "--app", APP, "--xy", "10,10", "--via", "mouse")
+        self.assertEqual(code, 11)
+        self.assertEqual(d["reasonCode"], "needs_takeover")
+
+    def test_key_without_menu_item_requires_takeover(self):
+        d, code = run("key", "--app", APP, "--key", "super+alt+shift+z")
+        self.assertEqual(code, 11)
+        self.assertEqual(d["reasonCode"], "needs_takeover")
+
+    def test_user_active_blocks_takeover(self):
+        """用户刚操作过就拒绝接管，且给出可读原因。"""
+        d, code = run("click", "--app", APP, "--xy", "10,10", "--via", "mouse",
+                      "--take-over", "--idle-seconds", "9999")
+        # 要么因为用户活跃被挡（12），要么已经空闲到离谱则走到别处；前者才是常态
+        self.assertIn(code, (12, 13, 14))
+        if code == 12:
+            self.assertEqual(d["reasonCode"], "user_active")
+            self.assertIn("idleSeconds", d)
+
+
+@unittest.skipUnless(AVAILABLE, "AX 不可用")
 class TestShot(unittest.TestCase):
     def setUp(self):
         if not APP:

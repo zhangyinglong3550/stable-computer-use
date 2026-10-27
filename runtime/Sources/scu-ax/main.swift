@@ -579,6 +579,140 @@ guard let cmd = args.positional.first else {
     die("usage: scu-ax <doctor|apps|snapshot|act|verify> [options]", code: 1)
 }
 
+// MARK: - 不打扰用户：AX 优先 + 显式接管
+
+/// 用户最近一次操作距现在多久（秒）。用来避免在用户正在用电脑时抢焦点。
+func userIdleSeconds() -> Double {
+    let types: [CGEventType] = [.keyDown, .mouseMoved, .leftMouseDown, .rightMouseDown,
+                                .scrollWheel, .flagsChanged]
+    return types.map {
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0)
+    }.min() ?? 0
+}
+
+/// 会抢焦点的动作必须同时满足：显式 --take-over + 用户已经空闲够久。
+func requireTakeOver(_ args: Args, why: String) {
+    guard args.has("take-over") else {
+        emit(["ok": false, "reasonCode": "needs_takeover", "why": why,
+              "hint": "这个动作必须把目标窗口切到前台，会打断用户。"
+                    + "确认要接管时加 --take-over；否则请改用 AX 路径（--via ax / set / type）"])
+        exit(11)
+    }
+    let need = Double(args.flag("idle-seconds") ?? "2.0") ?? 2.0
+    let idle = userIdleSeconds()
+    if idle < need {
+        emit(["ok": false, "reasonCode": "user_active",
+              "idleSeconds": (idle * 10).rounded() / 10, "requiredIdleSeconds": need,
+              "hint": "用户刚操作过电脑，现在抢焦点会打断他。等用户空闲后再试，或降低 --idle-seconds"])
+        exit(12)
+    }
+}
+
+/// 屏幕坐标 → AX 元素。不需要移动鼠标。
+func elementAtPoint(_ pid: pid_t, _ p: CGPoint) -> AXUIElement? {
+    let axApp = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(axApp, 1.5)
+    var el: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(axApp, Float(p.x), Float(p.y), &el) == .success else {
+        return nil
+    }
+    return el
+}
+
+/// 从命中的元素往上找第一个能"按"的祖先（图标命中的往往是 AXImage，本身没动作）
+func pressable(_ el: AXUIElement, maxHops: Int = 10) -> (element: AXUIElement, action: String)? {
+    let preferred = ["AXPress", "AXOpen", "AXConfirm", "AXPick", "AXShowMenu"]
+    var cur: AXUIElement? = el
+    var hops = 0
+    while let c = cur, hops < maxHops {
+        var acts: CFArray?
+        if AXUIElementCopyActionNames(c, &acts) == .success, let list = acts as? [String] {
+            for want in preferred where list.contains(want) {
+                return (c, want)
+            }
+        }
+        var parentRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &parentRef) == .success,
+           let p = parentRef as! AXUIElement? {
+            cur = p
+        } else {
+            cur = nil
+        }
+        hops += 1
+    }
+    return nil
+}
+
+func elementSnapshot(_ el: AXUIElement) -> [String: Any] {
+    var out: [String: Any] = [:]
+    if let r = asText(attr(el, kAXRoleAttribute)) { out["role"] = r }
+    if let t = asText(attr(el, kAXTitleAttribute)) { out["label"] = t }
+    else if let d = asText(attr(el, kAXDescriptionAttribute)) { out["label"] = d }
+    return out
+}
+
+// ---- 菜单栏快捷方式：不需要焦点就能触发 ----
+
+/// 解析 "super+shift+s" → (字符, 修饰键位掩码)
+/// AXMenuItemCmdModifiers 的位：1=shift, 2=option, 4=control；0 表示只带 Command。
+func chordToMenuItem(_ chord: String) -> (key: String, mods: Int)? {
+    let parts = chord.lowercased().split(separator: "+").map {
+        $0.trimmingCharacters(in: .whitespaces)
+    }.filter { !$0.isEmpty }
+    guard let key = parts.last, key.count == 1 else { return nil }
+    var mods = 0
+    var hasCommand = false
+    for m in parts.dropLast() {
+        switch m {
+        case "super", "cmd", "command", "meta": hasCommand = true
+        case "shift": mods |= 1
+        case "alt", "option", "opt": mods |= 2
+        case "ctrl", "control": mods |= 4
+        default: return nil
+        }
+    }
+    // 没有 Command 的组合不是菜单快捷键
+    guard hasCommand else { return nil }
+    return (key, mods)
+}
+
+func findAndPressMenuItem(_ appAx: AXUIElement, key: String, mods: Int) -> Bool {
+    guard let menuBar = attr(appAx, kAXMenuBarAttribute) else { return false }
+    var pressed = false
+
+    func walk(_ el: AXUIElement, _ depth: Int) {
+        if pressed || depth > 6 { return }
+        let role = asText(attr(el, kAXRoleAttribute)) ?? ""
+        if role == "AXMenuItem" {
+            let cmdChar = (asText(attr(el, "AXMenuItemCmdChar")) ?? "").lowercased()
+            let cmdMods = (attr(el, "AXMenuItemCmdModifiers") as? NSNumber)?.intValue ?? -1
+            if cmdChar == key && cmdMods == mods {
+                if AXUIElementPerformAction(el, "AXPress" as CFString) == .success {
+                    pressed = true
+                    return
+                }
+            }
+        }
+        if let kids = attr(el, kAXChildrenAttribute) as? [AXUIElement] {
+            for k in kids { walk(k, depth + 1) }
+        }
+    }
+    walk(menuBar as! AXUIElement, 0)
+    return pressed
+}
+
+/// 往元素里写字，不需要焦点。
+func writeText(into el: AXUIElement, _ text: String) -> Bool {
+    // 可编辑控件：优先在光标处插入，其次整体赋值
+    if AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
+        return true
+    }
+    if AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFTypeRef) == .success {
+        return true
+    }
+    return false
+}
+
 switch cmd {
 
 case "doctor":
@@ -650,101 +784,216 @@ case "snapshot":
 case "act":
     guard let appSpec = args.flag("app") else { die("missing --app", code: 4) }
     guard let op = args.flag("op") else { die("missing --op", code: 4) }
-    let s = snapshot(appSpec)
+    let wantMouse = args.flag("via") == "mouse"
 
-    if op == "key" {
-        guard let k = args.flag("key") else { die("missing --key", code: 4) }
-        activate(s.app)
-        pressKey(k)
-        emit(["ok": true, "op": op, "key": k])
-        break
-    }
-    if op == "type" {
-        guard let t = args.flag("text") else { die("missing --text", code: 4) }
-        activate(s.app)
-        typeText(t)
-        emit(["ok": true, "op": op, "chars": t.count])
-        break
-    }
+    // ---------- click ----------
+    if op == "click" {
+        let app = resolveApp(appSpec)
 
-    var target: Int = -1
-    if let ref = args.flag("ref") {
-        guard let i = findNode(s, ref: ref) else {
-            emit(["ok": false, "reasonCode": "stale_ref", "ref": ref,
-                  "hint": "ref 不在最新快照里，重新 snapshot 后重试"])
-            exit(5)
+        // 坐标点击
+        if let xs = args.flag("x"), let ys = args.flag("y"),
+           let px = Double(xs), let py = Double(ys) {
+            let pt = CGPoint(x: px, y: py)
+            if wantMouse {
+                requireTakeOver(args, why: "坐标鼠标点击会移动指针")
+                activate(app)
+                mouseClick(at: pt, button: (args.flag("button") == "right") ? .right : .left,
+                           count: args.int("count", 1))
+                emit(["ok": true, "op": "click", "via": "mouse", "x": px, "y": py])
+                break
+            }
+            // 默认：命中测试 → 往上找可按祖先 → AXPress。全程不动鼠标、不抢焦点。
+            guard let hit = elementAtPoint(app.app.processIdentifier, pt) else {
+                emit(["ok": false, "reasonCode": "no_element_at_point", "x": px, "y": py,
+                      "hint": "该坐标没有可访问元素（可能是 Electron 自绘区域）。"
+                            + "需要真的点像素时用 --via mouse --take-over"])
+                exit(13)
+            }
+            guard let t = pressable(hit) else {
+                emit(["ok": false, "reasonCode": "no_ax_action_at_point", "x": px, "y": py,
+                      "element": elementSnapshot(hit),
+                      "hint": "命中了元素但没有可执行动作。需要真的点像素时用 --via mouse --take-over"])
+                exit(13)
+            }
+            let err = AXUIElementPerformAction(t.element, t.action as CFString)
+            var r: [String: Any] = ["ok": err == .success, "op": "click", "via": "ax-hit-test",
+                                    "x": px, "y": py, "action": t.action,
+                                    "element": elementSnapshot(t.element)]
+            if err != .success { r["reasonCode"] = "ax_action_failed" }
+            emit(r)
+            if err != .success { exit(14) }
+            break
         }
-        target = i
-    } else if let text = args.flag("text") {
-        let want = text.lowercased()
-        target = s.nodes.indices.first { i in
-            s.keep[i] && ((s.nodes[i].label ?? "").lowercased().contains(want)
-                          || (s.nodes[i].value ?? "").lowercased().contains(want))
-        } ?? -1
-        if target < 0 { emit(["ok": false, "reasonCode": "text_not_found", "text": text]); exit(6) }
-    }
 
-    switch op {
-    case "click":
+        // 元素点击
+        let s = snapshot(appSpec)
+        var target = -1
+        if let ref = args.flag("ref") {
+            guard let i = findNode(s, ref: ref) else {
+                emit(["ok": false, "reasonCode": "stale_ref", "ref": ref,
+                      "hint": "ref 不在最新快照里，重新 snapshot 后重试"])
+                exit(5)
+            }
+            target = i
+        } else if let text = args.flag("text") {
+            let want = text.lowercased()
+            target = s.nodes.indices.first { i in
+                s.keep[i] && ((s.nodes[i].label ?? "").lowercased().contains(want)
+                              || (s.nodes[i].value ?? "").lowercased().contains(want))
+            } ?? -1
+            if target < 0 { emit(["ok": false, "reasonCode": "text_not_found", "text": text]); exit(6) }
+        } else {
+            die("bad_args: click 需要 --ref / --text / --x --y", code: 4)
+        }
+
         let n = s.nodes[target]
         if !n.enabled {
             emit(["ok": false, "reasonCode": "disabled", "ref": n.ref]); exit(7)
         }
-        let via = args.flag("via") ?? "auto"
-        let useAX = via == "ax" || (via == "auto" && n.actions.contains("AXPress") && CONTROL_ROLES.contains(n.role))
-        if useAX {
-            let err = AXUIElementPerformAction(s.elems[target], "AXPress" as CFString)
-            if err == .success {
-                emit(["ok": true, "op": "click", "ref": n.ref, "via": "ax"])
-                break
+
+        // 默认永远先试 AX；只有显式 --via mouse 才动鼠标
+        if !wantMouse {
+            for act in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where n.actions.contains(act) {
+                if AXUIElementPerformAction(s.elems[target], act as CFString) == .success {
+                    emit(["ok": true, "op": "click", "ref": n.ref, "via": "ax", "action": act])
+                    exit(0)
+                }
             }
+            // 自己也按不动，试试祖先
+            if let t = pressable(s.elems[target]) {
+                if AXUIElementPerformAction(t.element, t.action as CFString) == .success {
+                    emit(["ok": true, "op": "click", "ref": n.ref, "via": "ax-ancestor",
+                          "action": t.action])
+                    exit(0)
+                }
+            }
+            emit(["ok": false, "reasonCode": "no_ax_action", "ref": n.ref, "role": n.role,
+                  "hint": "这个元素没有可执行的无障碍动作。需要真点像素时用 --via mouse --take-over"])
+            exit(13)
         }
+
+        requireTakeOver(args, why: "鼠标点击会移动指针")
         guard let p = centerOf(s.nodes, target, keep: s.keep) else {
             emit(["ok": false, "reasonCode": "no_geometry", "ref": n.ref]); exit(8)
         }
-        if !args.has("no-activate") { activate(s.app) }
-        let btn: CGMouseButton = (args.flag("button") == "right") ? .right : .left
-        mouseClick(at: p, button: btn, count: args.int("count", 1))
-        emit(["ok": true, "op": "click", "ref": n.ref, "via": "mouse",
-              "x": p.x, "y": p.y])
+        activate(s.app)
+        mouseClick(at: p, button: (args.flag("button") == "right") ? .right : .left,
+                   count: args.int("count", 1))
+        emit(["ok": true, "op": "click", "ref": n.ref, "via": "mouse", "x": p.x, "y": p.y])
+        break
+    }
 
-    case "set":
+    // ---------- set ----------
+    if op == "set" {
+        let s = snapshot(appSpec)
+        guard let ref = args.flag("ref"), let i = findNode(s, ref: ref) else {
+            emit(["ok": false, "reasonCode": "stale_ref"]); exit(5)
+        }
         guard let v = args.flag("value") else { die("missing --value", code: 4) }
-        let err = AXUIElementSetAttributeValue(s.elems[target], kAXValueAttribute as CFString, v as CFTypeRef)
-        emit(["ok": err == .success, "op": "set", "ref": s.nodes[target].ref,
-              "reasonCode": err == .success ? "" : "set_failed"])
+        let ok = writeText(into: s.elems[i], v)
+        emit(["ok": ok, "op": "set", "ref": ref, "via": "ax",
+              "reasonCode": ok ? "" : "set_failed"])
+        if !ok { exit(14) }
+        break
+    }
 
-    case "scroll":
+    // ---------- type ----------
+    if op == "type" {
+        guard let t = args.flag("text") else { die("missing --text", code: 4) }
+        let app = resolveApp(appSpec)
+        // 目标：指定 ref 的元素，或该 app 当前的焦点元素。都不需要 app 在前台。
+        var targetEl: AXUIElement?
+        if let ref = args.flag("ref") {
+            let s = snapshot(appSpec)
+            if let i = findNode(s, ref: ref) { targetEl = s.elems[i] }
+        } else {
+            var f: CFTypeRef?
+            if AXUIElementCopyAttributeValue(app.ax, kAXFocusedUIElementAttribute as CFString, &f) == .success {
+                targetEl = (f as! AXUIElement)
+            }
+        }
+        if let el = targetEl, writeText(into: el, t) {
+            emit(["ok": true, "op": "type", "via": "ax", "chars": t.count])
+            break
+        }
+        // AX 写不进去 —— 需要真键盘，必须接管
+        requireTakeOver(args, why: "键盘输入需要目标窗口获得焦点")
+        activate(app)
+        typeText(t)
+        emit(["ok": true, "op": "type", "via": "keyboard", "chars": t.count])
+        break
+    }
+
+    // ---------- key ----------
+    if op == "key" {
+        guard let k = args.flag("key") else { die("missing --key", code: 4) }
+        let app = resolveApp(appSpec)
+        if !wantMouse {
+            // 先试菜单栏：命中就能在后台触发，不碰焦点
+            if let (key, mods) = chordToMenuItem(k), findAndPressMenuItem(app.ax, key: key, mods: mods) {
+                emit(["ok": true, "op": "key", "key": k, "via": "menu-item"])
+                break
+            }
+            emit(["ok": false, "reasonCode": "needs_takeover", "key": k,
+                  "hint": "这个组合键不是菜单项，只能靠真键盘发送，需要目标窗口聚焦。"
+                        + "确认要接管时加 --take-over"])
+            exit(11)
+        }
+        requireTakeOver(args, why: "发送组合键需要目标窗口聚焦")
+        activate(app)
+        pressKey(k)
+        emit(["ok": true, "op": "key", "key": k, "via": "keyboard"])
+        break
+    }
+
+    // ---------- scroll ----------
+    if op == "scroll" {
+        let s = snapshot(appSpec)
+        guard let ref = args.flag("ref"), let i = findNode(s, ref: ref) else {
+            emit(["ok": false, "reasonCode": "stale_ref"]); exit(5)
+        }
         let dir = args.flag("direction") ?? "down"
         let pages = Double(args.flag("pages") ?? "1") ?? 1
-        guard let p = centerOf(s.nodes, target, keep: s.keep) else {
-            emit(["ok": false, "reasonCode": "no_geometry"]); exit(8)
-        }
-        if !args.has("no-activate") { activate(s.app) }
-        let src = CGEventSource(stateID: .hidSystemState)
-        var dy: Int32 = 0, dx: Int32 = 0
-        let amount = Int32(10 * pages)
+        // 滚动走 AX 动作，同样不需要焦点
+        let axAction: String
         switch dir {
-        case "up": dy = amount
-        case "down": dy = -amount
-        case "left": dx = amount
-        default: dx = -amount
+        case "up": axAction = "AXScrollUpByPage"
+        case "down": axAction = "AXScrollDownByPage"
+        case "left": axAction = "AXScrollLeftByPage"
+        default: axAction = "AXScrollRightByPage"
         }
-        CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)?
-            .post(tap: .cghidEventTap)
-        usleep(20_000)
-        let steps = max(1, Int(abs(pages) * 3))
-        for _ in 0..<steps {
-            CGEvent(scrollWheelEvent2Source: src, units: .line,
-                    wheelCount: 2, wheel1: dy / Int32(steps), wheel2: dx / Int32(steps), wheel3: 0)?
+        var cur: AXUIElement? = s.elems[i]
+        var hops = 0
+        while let c = cur, hops < 10 {
+            var acts: CFArray?
+            if AXUIElementCopyActionNames(c, &acts) == .success,
+               let list = acts as? [String], list.contains(axAction) {
+                for _ in 0..<max(1, Int(pages.rounded())) {
+                    _ = AXUIElementPerformAction(c, axAction as CFString)
+                }
+                emit(["ok": true, "op": "scroll", "direction": dir, "via": "ax", "action": axAction])
+                exit(0)
+            }
+            var parentRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &parentRef) == .success,
+               let p = parentRef as! AXUIElement? { cur = p } else { cur = nil }
+            hops += 1
+        }
+        requireTakeOver(args, why: "这个容器没有 AX 滚动动作，只能合成滚轮事件")
+        if let p = centerOf(s.nodes, i, keep: s.keep) {
+            activate(s.app)
+            let src = CGEventSource(stateID: .hidSystemState)
+            CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)?
                 .post(tap: .cghidEventTap)
-            usleep(12_000)
+            let dy: Int32 = (dir == "up" ? 1 : -1) * Int32(10 * pages)
+            CGEvent(scrollWheelEvent2Source: src, units: .line, wheelCount: 1,
+                    wheel1: dy, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
         }
-        emit(["ok": true, "op": "scroll", "direction": dir, "pages": pages])
-
-    default:
-        die("unknown --op \(op)", code: 4)
+        emit(["ok": true, "op": "scroll", "direction": dir, "via": "wheel"])
+        break
     }
+
+    die("unknown --op \(op)", code: 4)
 
 case "verify":
     guard let appSpec = args.flag("app"), let ref = args.flag("ref") else {

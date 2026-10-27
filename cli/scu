@@ -667,7 +667,9 @@ def cmd_snapshot(args) -> int:
 EXIT_CODES = {
     "stale_ref": 5, "text_not_found": 6, "disabled": 7, "no_geometry": 8,
     "app_not_found": 2, "no_window": 3, "ax_timeout": 9, "ax_cannot_complete": 10,
-    "recipe_not_found": 2,
+    "needs_takeover": 11, "user_active": 12,
+    "no_element_at_point": 13, "no_ax_action_at_point": 13, "no_ax_action": 13,
+    "ax_action_failed": 14, "recipe_not_found": 2,
 }
 
 
@@ -686,33 +688,48 @@ def _act(args, op: str, extra: list[str]) -> int:
 
 def cmd_click(args) -> int:
     extra: list[str] = []
-    if args.ref:
+    if args.xy:
+        try:
+            x, y = [float(v) for v in args.xy.split(",")]
+        except ValueError:
+            die("bad_args", "--xy 格式应为 X,Y（屏幕坐标点）", 4)
+        extra += ["--x", str(x), "--y", str(y)]
+    elif args.ref:
         extra += ["--ref", args.ref]
     elif args.text:
         extra += ["--text", args.text]
     else:
-        die("bad_args", "click 需要 --ref 或 --text", 4)
+        die("bad_args", "click 需要 --ref / --text / --xy 三者之一", 4)
     for k, v in (("via", args.via), ("button", args.button), ("count", args.count)):
         if v:
             extra += [f"--{k}", str(v)]
-    if args.no_activate:
-        extra.append("--no-activate")
+    if args.take_over:
+        extra += ["--take-over", "--idle-seconds", str(args.idle_seconds)]
     return _act(args, "click", extra)
 
 
 def cmd_type(args) -> int:
     extra = ["--text", args.text]
+    if args.ref:
+        extra += ["--ref", args.ref]
+    if args.take_over:
+        extra += ["--take-over", "--idle-seconds", str(args.idle_seconds)]
     return _act(args, "type", extra)
 
 
 def cmd_key(args) -> int:
-    return _act(args, "key", ["--key", args.key])
+    extra = ["--key", args.key, "--via", args.via]
+    if args.take_over:
+        extra += ["--take-over", "--idle-seconds", str(args.idle_seconds)]
+    return _act(args, "key", extra)
 
 
 def cmd_scroll(args) -> int:
     extra = ["--ref", args.ref, "--direction", args.direction]
     if args.pages:
         extra += ["--pages", str(args.pages)]
+    if args.take_over:
+        extra += ["--take-over", "--idle-seconds", str(args.idle_seconds)]
     return _act(args, "scroll", extra)
 
 
@@ -809,9 +826,29 @@ def cmd_shot(args) -> int:
     proc = subprocess.run(argv, capture_output=True, text=True)
     if proc.returncode != 0 or not Path(out_path).is_file():
         die("shot_failed", (proc.stderr or "screencapture 失败")[:200], 9)
-    return out({"ok": True, "path": out_path, "rect": rect,
+    # Retina 屏上 screencapture -R 输出的是 2x 像素，而 AX 矩形是点。
+    # 不告诉调用方这个比例，从截图里量出来的坐标就会差一倍。
+    scale = _image_scale(out_path, w, h)
+    return out({"ok": True, "path": out_path, "rect": rect, "scale": scale,
+                "hint": (f"图像像素 = 屏幕点 × {scale}；点击时请用屏幕坐标点："
+                         f"screen_x = {x} + img_x / {scale}, screen_y = {y} + img_y / {scale}"),
                 "bytes": Path(out_path).stat().st_size,
                 "note": "矩形截图会带上覆盖在窗口上的其他窗口；需要纯净窗口图请走 ScreenCaptureKit"})
+
+
+def _image_scale(path: str, point_w: int, point_h: int) -> float:
+    """从 PNG 头读像素尺寸，和窗口点数相除得到缩放比。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(33)
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            import struct
+            px_w, px_h = struct.unpack(">II", head[16:24])
+            if point_w > 0:
+                return round(px_w / point_w, 3)
+    except Exception:
+        pass
+    return 1.0
 
 
 def cmd_bench(args) -> int:
@@ -848,20 +885,33 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--app", required=True)
     c.add_argument("--ref")
     c.add_argument("--text")
-    c.add_argument("--via", default="auto", choices=["auto", "ax", "mouse"])
+    c.add_argument("--xy", help="屏幕坐标 X,Y（配合 scs shot 使用）")
+    c.add_argument("--via", default="ax", choices=["ax", "mouse"],
+                   help="ax=走无障碍动作（不动鼠标、不抢焦点，默认）；mouse=合成鼠标事件")
     c.add_argument("--button", choices=["left", "right"])
     c.add_argument("--count", type=int)
-    c.add_argument("--no-activate", action="store_true")
+    c.add_argument("--take-over", action="store_true",
+                   help="明确授权接管前台（会打断用户）。仅在 --via mouse 或键盘输入时需要")
+    c.add_argument("--idle-seconds", type=float, default=2.0,
+                   help="接管前要求用户已空闲的秒数，默认 2 秒")
     c.set_defaults(fn=cmd_click)
 
     t = sub.add_parser("type")
     t.add_argument("--app", required=True)
     t.add_argument("--text", required=True)
+    t.add_argument("--ref", help="目标输入框的 ref（不给则用该 app 的焦点元素）")
+    t.add_argument("--take-over", action="store_true",
+                   help="AX 写不进去时，授权切到前台用真键盘输入")
+    t.add_argument("--idle-seconds", type=float, default=2.0)
     t.set_defaults(fn=cmd_type)
 
     k = sub.add_parser("key")
     k.add_argument("--app", required=True)
     k.add_argument("--key", required=True)
+    k.add_argument("--via", default="ax", choices=["ax", "mouse"],
+                   help="ax=先查菜单栏（后台可触发）；mouse=真键盘，需要接管前台")
+    k.add_argument("--take-over", action="store_true")
+    k.add_argument("--idle-seconds", type=float, default=2.0)
     k.set_defaults(fn=cmd_key)
 
     sc = sub.add_parser("scroll")
@@ -869,6 +919,8 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--ref", required=True)
     sc.add_argument("--direction", default="down", choices=["up", "down", "left", "right"])
     sc.add_argument("--pages", type=float, default=1.0)
+    sc.add_argument("--take-over", action="store_true")
+    sc.add_argument("--idle-seconds", type=float, default=2.0)
     sc.set_defaults(fn=cmd_scroll)
 
     st = sub.add_parser("set")

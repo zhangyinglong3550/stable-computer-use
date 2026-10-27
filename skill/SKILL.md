@@ -17,6 +17,21 @@ scu doctor
 
 `accessibility` 必须是 `true`。不是的话请用户去 **系统设置 → 隐私与安全性 → 辅助功能** 勾选终端，然后重新运行。不要假装能操作。
 
+## 铁律：不要打扰用户
+
+**他的鼠标和焦点属于他，不属于你。**
+
+- 默认路径全是 AX，不动鼠标、不抢焦点、不激活 app —— 就这样用
+- **不要**随便加 `--take-over`。只有用户明确说"你直接操作吧/我不在用"时才加
+- 被 `needs_takeover` / `user_active` 拒绝时，**不要绕过去**：换个 AX 路径，或者问用户
+- `no_ax_action_at_point` 说明这个坐标是自绘区域，先问用户能不能接管，别自己决定
+
+```bash
+scu click --app X --ref R          # ✅ 默认
+scu click --app X --xy 100,200     # ✅ 命中测试，仍不动鼠标
+scu click --app X --xy 100,200 --via mouse --take-over   # ⚠️ 会打断用户，先问
+```
+
 ## 基本循环
 
 ```bash

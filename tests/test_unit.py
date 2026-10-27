@@ -136,6 +136,9 @@ class TestExitCodes(unittest.TestCase):
         self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "stale_ref"}), 5)
         self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "disabled"}), 7)
         self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "ax_cannot_complete"}), 10)
+        self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "needs_takeover"}), 11)
+        self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "user_active"}), 12)
+        self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "no_ax_action_at_point"}), 13)
 
     def test_unknown_reason_is_1(self):
         self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "wat"}), 1)

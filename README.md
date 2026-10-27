@@ -29,6 +29,50 @@ stable-computer-use 换成另一条路：**读 AX 树，按元素操作**。
 
 ---
 
+## 最重要的一条：不打扰用户
+
+**默认情况下，`scu` 不会移动你的鼠标、不会切换焦点、不会激活目标 app。** 你继续干你的活，它在后台点。
+
+| 动作 | 默认路径 | 会打扰你吗 |
+|---|---|---|
+| 点按钮 / 菜单项 | `AXUIElementPerformAction` | ❌ 不移动指针，不抢焦点 |
+| 按坐标点 | 命中测试 → 找可点祖先 → `AXPress` | ❌ 同上 |
+| 往输入框写字 | 直接写 `AXSelectedText` / `AXValue` | ❌ 不需要窗口在前台 |
+| 滚动 | AX 滚动动作 | ❌ |
+| 组合键 ⌘K 等 | 查菜单栏里的同名菜单项并触发 | ❌（命中时） |
+| 读界面 | AX 树 / 按窗口截图 | ❌ |
+
+**只有确实没有办法的动作**才会要求接管前台，而且必须两个条件同时满足：
+
+```bash
+scu click --app X --xy 100,200 --via mouse --take-over --idle-seconds 2
+#                                              ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+#                                              明确授权      你至少空闲 2 秒
+```
+
+不满足就拒绝，并给出明确原因：
+
+| reasonCode | exit | 含义 |
+|---|---|---|
+| `needs_takeover` | 11 | 这个动作会打断你，需要显式 `--take-over` |
+| `user_active` | 12 | 你刚操作过电脑，现在抢焦点会打扰你 |
+| `no_ax_action_at_point` | 13 | 该坐标没有可执行的无障碍元素（可以退回 `--via mouse`） |
+
+**实测**：对 Finder 标题栏做坐标点击，返回 `no_ax_action_at_point`，鼠标位置前后**完全一致**。
+
+### 为什么能做到
+
+Codex 的 computer-use 也是这么做的——我拆了它的二进制，它**根本不合成鼠标事件**：
+
+```
+SkyComputerUseService 导入的符号里没有 CGEventPost / CGEventPostToPid / IOHIDPostEvent
+只有 AXUIElementPerformAction、AXUIElementSetAttributeValue、AXUIElementCopyElementAtPosition
+```
+
+它点按钮的方式就是直接告诉按钮"你被按了"，压根不碰指针。
+
+唯一绕不开的是**真键盘输入**：实测 `CGEvent.postToPid` 能把事件投给指定进程且不移动鼠标，但 app 不在前台时**不会响应**。所以组合键要么走菜单栏，要么就得接管。
+
 ## 为什么是它：三个可验证的点
 
 ### 1. 快照快到不值得优化

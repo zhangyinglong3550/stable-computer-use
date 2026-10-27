@@ -175,6 +175,63 @@ handoff → 返回候选表，交回调用方                    0 成本
 
 ---
 
+## 9. 输入合成：默认不打扰用户
+
+这是整个项目最重要的设计约束 —— **用户正在用电脑时，Agent 不能和他抢**。
+
+### 9.1 先说 Codex 怎么做的（拆二进制得到的事实）
+
+```
+SkyComputerUseService 导入符号：
+  AXUIElementPerformAction / SetAttributeValue / CopyElementAtPosition / CopyAttributeValue...
+  CGEventGetFlags   ← 只用来读修饰键状态
+
+  ✗ 没有 CGEventPost
+  ✗ 没有 CGEventPostToPid
+  ✗ 没有 IOHIDPostEvent
+```
+
+整个 CUA 包、`codex` 主程序、ChatGPT 主程序都查过，一处都没有。
+**它不合成鼠标键盘事件，全部通过无障碍动作完成。** 这就是"不占桌面"的真正原因 ——
+它压根不碰桌面那一层，而不是"占得比较少"。
+
+### 9.2 三层策略
+
+| 层 | 手段 | 是否打扰用户 |
+|---|---|---|
+| 元素操作 | `AXUIElementPerformAction`（AXPress/AXOpen/AXConfirm） | 否 |
+| 坐标操作 | `AXUIElementCopyElementAtPosition` → 向上找可按祖先 → AXPress | 否 |
+| 文本写入 | `AXUIElementSetAttributeValue`（AXSelectedText / AXValue） | 否 |
+| 滚动 | `AXScrollUpByPage` 等动作 | 否 |
+| 组合键 | 找 `AXMenuItemCmdChar` + `AXMenuItemCmdModifiers` 匹配的菜单项并 AXPress | 否 |
+| 兜底 | `CGEvent` 合成 | **是**，必须显式授权 |
+
+### 9.3 实测过的两件事
+
+**① 后台 AXPress 真的能工作。** 飞书不是前台 app，直接对它发 AXPress，
+搜索模态被打开了，鼠标没动、前台 app 没变。
+
+**② `CGEvent.postToPid` 能不动鼠标，但后台 app 不响应。**
+发给飞书 pid 一个 ⌘K：鼠标位置前后完全一致（说明 `postToPid` 有效），
+但飞书毫无反应 —— 键盘事件必须 app 活跃才生效。
+
+所以组合键没有纯后台方案，只能走菜单栏，否则必须接管。这是硬约束，不是实现偷懒。
+
+### 9.4 接管的两个门槛
+
+```bash
+--take-over                  # 1. 显式授权
+--idle-seconds 2             # 2. 用户至少空闲这么久
+```
+
+`--idle-seconds` 用 `CGEventSource.secondsSinceLastEventType(.combinedSessionState, ...)`
+取键盘/鼠标/滚动/修饰键里最近的一次事件。
+
+默认 **2 秒**：用户停下手的 2 秒内不会去抢。这比"检测到用户在用就永远不做"实用 ——
+Agent 总能等到空隙。
+
+拒绝时给出可分流的原因：`needs_takeover`(11) / `user_active`(12) / `no_ax_action_at_point`(13)。
+
 ## 9. 输入合成
 
 | 场景 | 做法 | 副作用 |
