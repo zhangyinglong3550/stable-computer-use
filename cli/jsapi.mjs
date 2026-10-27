@@ -80,7 +80,10 @@ class App {
 
   /** 取状态。默认返回紧凑文本；{json:true} 返回原始结构。 */
   async state(opts = {}) {
-    const snap = await rpc({ cmd: "snapshot", app: this.name, max: opts.max ?? 4000 });
+    const snap = await rpc({
+      cmd: "snapshot", app: this.name, max: opts.max ?? 4000,
+      actions: opts.actions !== false,
+    });
     if (snap.ok === false) throw new Error(`state failed: ${snap.reasonCode || "unknown"}`);
     return opts.json ? snap : renderState(snap);
   }

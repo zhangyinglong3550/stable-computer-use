@@ -190,7 +190,8 @@ struct Identity: Hashable {
     let rect: String
 }
 
-func collect(_ root: AXUIElement, maxN: Int, maxDepth: Int, visibleRect: CGRect? = nil)
+func collect(_ root: AXUIElement, maxN: Int, maxDepth: Int, visibleRect: CGRect? = nil,
+             withActions: Bool = true)
     -> (nodes: [Node], elems: [AXUIElement], truncated: Bool, cycles: Int) {
 
     var nodes: [Node] = []
@@ -224,7 +225,7 @@ func collect(_ root: AXUIElement, maxN: Int, maxDepth: Int, visibleRect: CGRect?
             skipped += 1
             return
         }
-        let acts = actionsFor(el, role: info.role)
+        let acts = withActions ? actionsFor(el, role: info.role) : []
         let me = nodes.count
         nodes.append(Node(role: info.role, subrole: info.subrole, label: info.label, value: info.value,
                           actions: acts, enabled: info.enabled, rect: info.rect, depth: depth, parent: parent))
@@ -391,7 +392,7 @@ func windowRect(_ w: AXUIElement) -> CGRect? {
 }
 
 func snapshot(_ spec: String, maxN: Int = 4000, maxDepth: Int = 20,
-              visibleOnly: Bool = true) -> Snapshot? {
+              visibleOnly: Bool = true, withActions: Bool = true) -> Snapshot? {
     guard let a = resolveAppSafe(spec), let w = targetWindow(a) else { return nil }
     // 窗口矩形 ∩ 它所在屏幕的可用区域 = 真正看得见的部分
     var visible: CGRect? = nil
@@ -401,7 +402,8 @@ func snapshot(_ spec: String, maxN: Int = 4000, maxDepth: Int = 20,
             break
         }
     }
-    let (nodes, elems, truncated, cycles) = collect(w, maxN: maxN, maxDepth: maxDepth, visibleRect: visible)
+    let (nodes, elems, truncated, cycles) = collect(w, maxN: maxN, maxDepth: maxDepth,
+                                                    visibleRect: visible, withActions: withActions)
     let keep = prune(nodes)
     var out = nodes
     let sigs = assignSignatures(nodes, keep: keep)
@@ -872,10 +874,12 @@ func writeLine(_ fd: Int32, _ obj: [String: Any]) {
 /// 界面指纹：只看留下来的节点的 ref/文字/值/可用性。
 /// 用来判断"动作之后界面到底变没变"，从而避免截图。
 func signature(_ s: Snapshot) -> String {
+    // 只用「角色 + 文字 + 值 + 可用性」，**不依赖 keep 和 ref**。
+    // keep 取决于要不要读动作，ref 取决于 keep —— 用它俩会让"带动作"和"不带动作"
+    // 算出的签名不可比（踩过这个坑：轻量快照下变化检测永远返回没变）。
     var h: UInt64 = 0xcbf2_9ce4_8422_2325
-    for i in s.nodes.indices where s.keep[i] {
-        let n = s.nodes[i]
-        let part = n.ref + "|" + (n.label ?? "") + "|" + (n.value ?? "") + "|" + (n.enabled ? "1" : "0")
+    for n in s.nodes {
+        let part = n.role + "|" + (n.label ?? "") + "|" + (n.value ?? "") + "|" + (n.enabled ? "1" : "0")
         for ch in part.utf8 {
             h ^= UInt64(ch)
             h = h &* 0x1000_0000_01b3
@@ -887,13 +891,15 @@ func signature(_ s: Snapshot) -> String {
 /// 执行一个动作，然后轮询直到界面变化（或超时）。
 /// 这是替代"动作后截图给模型看"的关键原语：一次遍历 30–120ms，比一次视觉判断快一个数量级。
 func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [String: Any] {
-    guard let before = snapshot(appSpec) else {
+    // 轮询只需要"变没变"，不需要动作列表 —— 省掉一半 IPC
+    guard let before = snapshot(appSpec, withActions: false) else {
         return ["ok": false, "reasonCode": "no_window", "app": appSpec]
     }
-    cacheStore(before)
+    // 注意：这里**不** cacheStore —— 轻量快照没有动作列表，覆盖缓存会让后续点击失效
     let sigBefore = signature(before)
 
     // ---- 执行 ----
+    let tActStart = Date()
     var actResult: [String: Any] = ["ok": true]
     if let ref = req["ref"] as? String {
         actResult = cachedPress(ref)
@@ -944,15 +950,15 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     }
 
     // ---- 等变化 ----
+    let actMs = Int(Date().timeIntervalSince(tActStart) * 1000)
     let started = Date()
     var changed = false
     var waited = 0
     while waited < timeoutMs {
         usleep(45_000)
         waited = Int(Date().timeIntervalSince(started) * 1000)
-        guard let now = snapshot(appSpec) else { continue }
+        guard let now = snapshot(appSpec, withActions: false) else { continue }
         if signature(now) != sigBefore {
-            cacheStore(now)
             changed = true
             break
         }
@@ -960,6 +966,7 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
 
     var out = actResult
     out["changed"] = changed
+    out["actMs"] = actMs
     out["waitedMs"] = waited
     out["before"] = sigBefore
     if !changed { out["note"] = "界面没有变化：动作可能没生效，或者这个动作本来就不改界面" }
@@ -991,17 +998,24 @@ func handleClient(_ fd: Int32) {
 
     case "snapshot":
         let maxN = req["max"] as? Int ?? 4000
+        let t0 = Date()
         guard resolveAppSafe(appSpec) != nil else {
             writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec,
                            "running": NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }.sorted().prefix(40).map { $0 }])
             return
         }
-        guard let snap = snapshot(appSpec, maxN: maxN) else {
+        let wantActions = (req["actions"] as? Bool) ?? true
+        guard let snap = snapshot(appSpec, maxN: maxN, withActions: wantActions) else {
             writeLine(fd, ["ok": false, "reasonCode": "no_window", "app": appSpec]); return
         }
+        let tWalk = Date()
         cacheStore(snap)
         var out = toJSON(snap)
+        let tJson = Date()
         out["cached"] = cache.count
+        out["walkMs"] = Int(tWalk.timeIntervalSince(t0) * 1000)
+        out["jsonMs"] = Int(tJson.timeIntervalSince(tWalk) * 1000)
+        out["nodes"] = snap.nodes.count
         writeLine(fd, out)
 
     case "click":
