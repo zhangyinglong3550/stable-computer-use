@@ -1,0 +1,936 @@
+#!/usr/bin/env python3
+"""smac — stable-mac: 给任意 Agent 的 macOS 精准 computer-use CLI。
+
+设计要点
+- 单文件、纯标准库、无构建步骤（Swift 助手用 swift build 出，本文件只管调用）
+- 四级快路径：exact(0ms) → recipe(~50ms) → lexical(<1ms) → JEV(~2s) → 交回调用方
+- 每一级都如实报告自己在哪一级、置信度多少
+- 统一 reasonCode + exit code，调用方只写一条降级分支
+
+命令
+  smac doctor
+  smac apps
+  smac snapshot --app APP [--json] [--max N]
+  smac click --app APP (--ref R | --text T | --xy X,Y) [--via auto|ax|mouse]
+  smac type  --app APP --text T [--ref R]
+  smac key   --app APP --key "super+s"
+  smac scroll --app APP --ref R --direction down [--pages N]
+  smac set   --app APP --ref R --value V
+  smac verify --app APP --ref R
+  smac do    --app APP --goal "..."
+  smac decide --app APP --goal "..." [--no-decider] [--min-confidence X]
+  smac recipe save NAME < steps.json
+  smac recipe run  NAME --app APP
+  smac bench --app APP [--runs N]
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+VERSION = "0.1.0"
+
+# ---------------------------------------------------------------- 运行时定位
+
+HOME = Path.home()
+STATE_DIR = Path(os.getenv("SMAC_STATE", str(HOME / ".stable-mac")))
+RECIPE_DIR = STATE_DIR / "recipes"
+DECIDER_STATE_PATH = STATE_DIR / "decider-state.json"
+MEMORY_PATH = STATE_DIR / "memory.jsonl"
+
+
+def find_ax_binary() -> Path:
+    """按优先级找 smac-ax：环境变量 → 仓库内构建产物 → PATH。"""
+    env = os.getenv("SMAC_AX")
+    if env:
+        p = Path(env).expanduser()
+        if p.is_file():
+            return p
+        die("ax_binary_missing", f"SMAC_AX 指向的文件不存在：{p}", 2)
+
+    here = Path(__file__).resolve().parent
+    for rel in ("runtime/.build/release/smac-ax", "runtime/.build/debug/smac-ax"):
+        p = here.parent / rel
+        if p.is_file():
+            return p
+
+    from shutil import which
+
+    found = which("smac-ax")
+    if found:
+        return Path(found)
+    die(
+        "ax_binary_missing",
+        "找不到 smac-ax。先在 runtime/ 下执行 `swift build -c release`，"
+        "或设置 SMAC_AX 指向可执行文件。",
+        2,
+    )
+
+
+# ---------------------------------------------------------------- 输出约定
+
+def out(payload: dict, code: int = 0) -> int:
+    payload.setdefault("version", VERSION)
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return code
+
+
+def die(reason: str, detail: str, code: int = 1) -> None:
+    out({"ok": False, "reasonCode": reason, "detail": detail}, code)
+    raise SystemExit(code)
+
+
+# ---------------------------------------------------------------- 调 Swift 助手
+
+def run_ax(argv: list[str], timeout: float = 30.0) -> dict:
+    binary = find_ax_binary()
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            [str(binary)] + argv,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        die("ax_timeout", f"smac-ax {' '.join(argv)} 超时 {timeout}s", 9)
+    elapsed = int((time.time() - started) * 1000)
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        detail = (proc.stderr or "").strip()[:300] or "smac-ax 无输出"
+        # Swift 侧用 exit code 表达可恢复错误，这里透传
+        die(_reason_from_exit(proc.returncode), detail, proc.returncode or 1)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        die("ax_bad_json", raw[:300], 1)
+    payload.setdefault("elapsedMs", elapsed)
+    return payload
+
+
+def _reason_from_exit(code: int) -> str:
+    return {
+        2: "app_not_found",
+        3: "no_window",
+        4: "bad_args",
+        5: "stale_ref",
+        6: "text_not_found",
+        7: "disabled",
+        8: "no_geometry",
+        9: "ax_timeout",
+        10: "ax_cannot_complete",
+    }.get(code, "ax_failed")
+
+
+# ---------------------------------------------------------------- 文本清洗与打分
+
+_ZW = re.compile(r"[\u200b-\u200f\u2060\ufeff\u00ad\ufe00-\ufe0f]")
+
+INTERACTIVE_ROLES = {
+    "AXButton", "AXTextField", "AXTextArea", "AXCheckBox", "AXRadioButton",
+    "AXPopUpButton", "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTab",
+    "AXComboBox", "AXSlider", "AXIncrementor", "AXToolbarButton",
+    "AXDisclosureTriangle", "AXSearchField",
+}
+CONTAINER_ROLES = {"AXWindow", "AXGroup", "AXScrollArea", "AXOutline", "AXTable", "AXRow", "AXCell"}
+
+
+def clean(text: str | None) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", _ZW.sub("", unicodedata.normalize("NFKC", text))).strip().lower()
+
+
+def _grams(text: str) -> set[str]:
+    t = re.sub(r"[\s\W_]+", "", text)
+    if not t:
+        return set()
+    return {t} if len(t) == 1 else {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def _dice(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return 2 * len(a & b) / (len(a) + len(b))
+
+
+def _role_prior(role: str, has_action: bool) -> float:
+    if has_action:
+        base = 1.0
+    elif role in INTERACTIVE_ROLES:
+        base = 0.85
+    elif role in CONTAINER_ROLES:
+        base = 0.45
+    else:
+        base = 0.4
+    return 0.35 if role == "AXStaticText" else base
+
+
+def score_element(goal: str, el: dict) -> float:
+    q = clean(goal)
+    label = clean(el.get("label"))
+    value = clean(el.get("value"))
+
+    contain = 0.0
+    if q and label and (q in label or label in q):
+        contain = 1.0 if q == label else 0.9
+    elif q and value and (q in value or value in q):
+        contain = 0.6
+
+    text_s = max(_dice(_grams(q), _grams(label)),
+                 _dice(_grams(q), _grams(value)) * 0.75,
+                 contain)
+    total = text_s * _role_prior(el.get("role", ""), bool(el.get("actions")))
+    return total * (1.0 + min(el.get("depth", 0), 12) * 0.004)
+
+
+def useful_target(el: dict) -> bool:
+    """值得作为兜底候选的：有文字，或者是可交互角色/有动作的控件。"""
+    has_text = bool(el.get("label") or el.get("value"))
+    return has_text or bool(el.get("actions")) or el.get("role") in INTERACTIVE_ROLES
+
+
+def rank(goal: str, elements: list[dict], top_k: int = 8) -> list[dict]:
+    """闭集排序。永不返空 —— 词法弱时用可点击性兜底，绝不丢弃候选。"""
+    def key(e: dict) -> tuple:
+        # 分数 > 有文字 > 可点 > 浅层：没文字的空容器永远排最后
+        has_text = bool(e.get("label") or e.get("value"))
+        return (e["score"], has_text, bool(e.get("actions")), -e.get("depth", 0))
+
+    scored = [{**el, "score": round(score_element(goal, el), 4)} for el in elements]
+    scored.sort(key=key, reverse=True)
+    strong = [e for e in scored if e["score"] >= 0.05]
+    if len(strong) < top_k:
+        seen = {e["ref"] for e in strong}
+        backfill = [e for e in scored
+                    if e["ref"] not in seen and useful_target(e)][:top_k - len(strong)]
+        strong += backfill
+        strong.sort(key=key, reverse=True)
+    return strong[:top_k]
+
+
+CONFIDENCE_HIGH = 0.9
+CONFIDENCE_MEDIUM = 0.5
+
+
+def confidence_of(ranked: list[dict]) -> tuple[float, str]:
+    if not ranked:
+        return 0.0, "low"
+    top = ranked[0]["score"]
+    second = ranked[1]["score"] if len(ranked) > 1 else 0.0
+    margin = (top - second) / top if top else 0.0
+    conf = max(0.0, min(1.0, top * (0.55 + 0.45 * margin)))
+    gate = "high" if conf >= CONFIDENCE_HIGH else ("medium" if conf >= CONFIDENCE_MEDIUM else "low")
+    return round(conf, 3), gate
+
+
+def describe(el: dict) -> str:
+    role = el.get("role", "").replace("AX", "")
+    name = el.get("label") or el.get("value") or ""
+    extra = ""
+    if el.get("value") and el.get("label"):
+        extra = f" (当前值: {el['value']})"
+    return f"{role}: {name}{extra}".strip()
+
+
+# ---------------------------------------------------------------- snapshot
+
+def snapshot(app: str, max_n: int = 4000) -> dict:
+    snap = run_ax(["snapshot", "--app", app, "--json", "--max", str(max_n)])
+    elements = snap.get("elements") or []
+    # 文字节点的目标是最近的可点祖先 —— 直接换成祖先 ref，调用方不用关心
+    for el in elements:
+        if el.get("actionable_ref"):
+            el["target_ref"] = el["actionable_ref"]
+        else:
+            el["target_ref"] = el["ref"]
+    snap["elements"] = elements
+    return snap
+
+
+# ---------------------------------------------------------------- JEV
+
+TYPESAFE_URL = os.getenv("TYPESAFE_URL", "https://api.typesafe.ai/v1/systemone")
+TYPESAFE_MODEL = os.getenv("TYPESAFE_MODEL", "jev-latest")
+DECIDER_OK_TTL = 600
+DECIDER_FAIL_TTL = 300
+
+
+def _load_decider_state() -> dict:
+    try:
+        return json.loads(DECIDER_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_decider_state(state: dict) -> None:
+    try:
+        DECIDER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DECIDER_STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def typesafe_ask(state: dict, questions: dict, timeout: float = 30.0) -> dict:
+    body = json.dumps({"state": state, "model": TYPESAFE_MODEL, "questions": questions}).encode()
+    req = urllib.request.Request(
+        TYPESAFE_URL, data=body, method="POST",
+        headers={"Authorization": f"Bearer {os.environ['TYPESAFE_API_KEY']}",
+                 "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or "{}")
+
+
+def classify_decider_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return {401: "invalid_key", 403: "invalid_key", 402: "quota_exhausted",
+                404: "endpoint_not_found", 429: "rate_limited"}.get(exc.code, f"http_{exc.code}")
+    if isinstance(exc, urllib.error.URLError):
+        return "unreachable"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    return f"error_{type(exc).__name__}"
+
+
+def probe_decider(force: bool = False) -> dict:
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        return {"available": False, "reasonCode": "key_missing", "detail": "TYPESAFE_API_KEY 未设置"}
+    now = time.time()
+    if not force:
+        cached = _load_decider_state()
+        age = now - float(cached.get("at") or 0)
+        ttl = DECIDER_OK_TTL if cached.get("available") else DECIDER_FAIL_TTL
+        if cached and age < ttl:
+            return {**cached, "cached": True}
+    try:
+        typesafe_ask({"probe": "health check"},
+                     {"ok": {"type": "noul", "instructions": "Is this a health check?"}},
+                     timeout=8.0)
+        verdict = {"available": True, "reasonCode": "ok", "detail": "探测通过"}
+    except Exception as e:
+        verdict = {"available": False, "reasonCode": classify_decider_error(e),
+                   "detail": f"{type(e).__name__}: {e}"[:200]}
+    _save_decider_state({**verdict, "at": now})
+    return verdict
+
+
+# ---------------------------------------------------------------- 决策记忆
+
+def _mem_key(app: str, goal: str) -> str:
+    return hashlib.sha1(f"{app}||{clean(goal)}".encode()).hexdigest()[:16]
+
+
+def memory_lookup(app: str, goal: str, elements: list[dict]) -> dict | None:
+    """查记忆，并**在当前快照里验证**目标还在。ref 稳定，所以通常直接命中。
+
+    记忆存的是 ref + 名字 + 角色：ref 命中就用；ref 失效则按名字+角色重新定位。
+    """
+    if not MEMORY_PATH.is_file():
+        return None
+    key = _mem_key(app, goal)
+    entry = None
+    try:
+        for line in MEMORY_PATH.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec.get("key") == key:
+                entry = rec          # 后写的覆盖先写的
+    except Exception:
+        return None
+    if not entry:
+        return None
+
+    by_ref = {e["ref"]: e for e in elements}
+    live = by_ref.get(entry.get("ref"))
+    if live and (live.get("label") or live.get("value")):
+        return {**entry, "hit": "ref", "element": live}
+
+    want_label = clean(entry.get("label"))
+    want_role = entry.get("role")
+    for e in elements:
+        if clean(e.get("label")) == want_label and (not want_role or e.get("role") == want_role):
+            return {**entry, "hit": "label", "element": e}
+    return None
+
+
+def memory_store(app: str, goal: str, element: dict, source: str) -> None:
+    rec = {
+        "key": _mem_key(app, goal), "app": app, "goal": goal,
+        "ref": element.get("ref"), "label": element.get("label") or element.get("value"),
+        "role": element.get("role"), "source": source, "at": int(time.time()),
+    }
+    try:
+        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MEMORY_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- decide 四级阶梯
+
+def decide(app: str, goal: str, min_conf: float = CONFIDENCE_HIGH,
+           no_decider: bool = False, max_opts: int = 8) -> dict:
+    snap = snapshot(app)
+    elements = snap.get("elements") or []
+    if not elements:
+        return {"ok": False, "reasonCode": "empty_snapshot", "app": app}
+
+    # ---- L0 精确解析：目标里直接点名的元素 ----
+    exact = _exact_match(goal, elements)
+    if exact:
+        return {
+            "ok": True, "tier": "exact", "latencyMs": 0,
+            "goal": goal, "app": app,
+            "targetRef": exact["target_ref"], "targetName": exact.get("label") or exact.get("value"),
+            "targetRole": exact.get("role"),
+            "confidence": 1.0, "confidenceGate": "high", "recommendedAction": "act",
+        }
+
+    # ---- L1 记忆：同一个目标第二次来，零成本 ----
+    remembered = memory_lookup(app, goal, elements)
+    if remembered:
+        el = remembered["element"]
+        return {
+            "ok": True, "tier": "memory", "latencyMs": 0,
+            "goal": goal, "app": app,
+            "targetRef": el.get("target_ref", el["ref"]),
+            "targetName": el.get("label") or el.get("value"),
+            "targetRole": el.get("role"),
+            "memoryHit": remembered["hit"], "memorySource": remembered.get("source"),
+            "confidence": 0.99, "confidenceGate": "high", "recommendedAction": "act",
+        }
+
+    # ---- L2 recipe：录过就直接回放 ----
+    recipe = _find_recipe(app, goal)
+    if recipe:
+        return {
+            "ok": True, "tier": "recipe", "latencyMs": 0,
+            "goal": goal, "app": app,
+            "recipe": recipe["name"], "steps": recipe["steps"],
+            "confidence": 1.0, "confidenceGate": "high", "recommendedAction": "replay",
+        }
+
+    # ---- L2 本地打分 ----
+    ranked = rank(goal, elements, top_k=max_opts)
+    conf, gate = confidence_of(ranked)
+    best = ranked[0] if ranked else None
+    lexical = {
+        "tier": "lexical", "goal": goal, "app": app,
+        "targetRef": best.get("target_ref") if best else None,
+        "targetName": (best.get("label") or best.get("value")) if best else None,
+        "targetRole": best.get("role") if best else None,
+        "confidence": conf, "confidenceGate": gate,
+        "candidates": [_lean(e) for e in ranked],
+    }
+    if conf >= min_conf:
+        return {"ok": True, "recommendedAction": "act", "latencyMs": 0, **lexical}
+
+    # ---- L3 JEV：在本地说不准时才付这个成本 ----
+    if not no_decider:
+        health = probe_decider()
+        if health["available"]:
+            started = time.time()
+            try:
+                raw = typesafe_ask(
+                    {"goal": goal,
+                     "window": {"app": snap.get("app"), "title": snap.get("window")}},
+                    {
+                        "target": {
+                            "type": "choice",
+                            "criteria": {e["ref"]: describe(e) for e in ranked},
+                            "instructions": (
+                                f"目标是：{goal}\n\n"
+                                "应该操作下面哪一个界面元素？只选最能直接推进目标的那个。"
+                                "如果目标元素不在选项里，仍选出最接近的一个。"
+                            ),
+                        }
+                    },
+                )
+                latency = int((time.time() - started) * 1000)
+                answer = (raw.get("answers") or {}).get("target") or {}
+                choice = answer.get("choice")
+                chosen = next((e for e in ranked if e["ref"] == choice), None)
+                if chosen:
+                    memory_store(app, goal, chosen, source="jev")
+                    jconf = answer.get("confidence")
+                    jconf = float(jconf) if isinstance(jconf, (int, float)) else 0.5
+                    return {
+                        "ok": True, "tier": "jev", "latencyMs": latency,
+                        "goal": goal, "app": app,
+                        "targetRef": chosen.get("target_ref"),
+                        "targetName": chosen.get("label") or chosen.get("value"),
+                        "targetRole": chosen.get("role"),
+                        "confidence": round(jconf, 3),
+                        "confidenceGate": "high" if jconf >= CONFIDENCE_HIGH else (
+                            "medium" if jconf >= CONFIDENCE_MEDIUM else "low"),
+                        "recommendedAction": "act" if jconf >= CONFIDENCE_HIGH else "recheck",
+                        "probabilities": answer.get("probabilities"),
+                        "candidates": [_lean(e) for e in ranked],
+                    }
+            except Exception as e:
+                code = classify_decider_error(e)
+                _save_decider_state({"available": False, "reasonCode": code,
+                                     "detail": str(e)[:200], "at": time.time()})
+                return _handoff(lexical, code, f"JEV 失败（{code}）")
+        return _handoff(lexical, health["reasonCode"], f"JEV 不可用（{health['reasonCode']}）")
+
+    # ---- L4 交回调用方 ----
+    return _handoff(lexical, "decider_disabled", "已跳过决策器")
+
+
+def _handoff(lexical: dict, reason: str, detail: str) -> dict:
+    """低置信时也要交出**最佳猜测**，只是标记 ok=false。
+
+    调用方可以：(a) 直接把 bestGuess 当候选让 LLM 复核；(b) 忽略它自己从
+    candidates 里选。永远不要只丢一句"失败了"，那样调用方还得重跑一次。
+    """
+    return {
+        "ok": False, "tier": "handoff", "reasonCode": reason, "detail": detail,
+        "goal": lexical["goal"], "app": lexical["app"],
+        "confidence": lexical["confidence"], "confidenceGate": lexical["confidenceGate"],
+        "recommendedAction": "escalate",
+        "targetRef": lexical.get("targetRef"),
+        "targetName": lexical.get("targetName"),
+        "targetRole": lexical.get("targetRole"),
+        "bestGuess": {
+            "ref": lexical.get("targetRef"),
+            "name": lexical.get("targetName"),
+            "confidence": lexical.get("confidence"),
+        },
+        "hint": "用你自己的 LLM 在 candidates 里复核 bestGuess，或另选，然后 smac click --app A --ref R",
+        "candidates": lexical["candidates"],
+    }
+
+
+def _exact_match(goal: str, elements: list[dict]) -> dict | None:
+    """L0：目标里点名了某个元素，且名字足够独特 —— 零成本直出。
+
+    只接受「引号包裹」或「完整出现在目标里且全表唯一」的标签，宁漏不错。
+    """
+    quoted = re.findall(r"[\"'“”‘’「」『』]([^\"'“”‘’「」『』]{1,40})[\"'“”‘’「」『』]", goal)
+    probes = [clean(q) for q in quoted] + [clean(goal)]
+
+    for probe in probes:
+        if not probe:
+            continue
+        hits = [e for e in elements
+                if clean(e.get("label")) == probe or clean(e.get("value")) == probe]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            actionable = [h for h in hits if h.get("actions") or h.get("role") in INTERACTIVE_ROLES]
+            if len(actionable) == 1:
+                return actionable[0]
+    return None
+
+
+# ---------------------------------------------------------------- recipe
+
+def _recipe_path(name: str) -> Path:
+    return RECIPE_DIR / f"{name}.json"
+
+
+def _find_recipe(app: str, goal: str) -> dict | None:
+    if not RECIPE_DIR.is_dir():
+        return None
+    want = clean(goal)
+    for p in RECIPE_DIR.glob("*.json"):
+        try:
+            r = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if clean(r.get("goal", "")) == want and r.get("app") in (app, None):
+            return r
+    return None
+
+
+def cmd_recipe(args) -> int:
+    if args.action == "save":
+        steps = json.load(sys.stdin)
+        if not isinstance(steps, list) or not steps:
+            die("bad_recipe", "stdin 必须是步骤数组，例如 [{\"op\":\"click\",\"ref\":\"abc123\"}]", 4)
+        RECIPE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"name": args.name, "app": args.app, "goal": args.goal, "steps": steps}
+        _recipe_path(args.name).write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                                           encoding="utf-8")
+        return out({"ok": True, "saved": str(_recipe_path(args.name)), "steps": len(steps)})
+
+    if args.action == "list":
+        items = []
+        if RECIPE_DIR.is_dir():
+            for p in sorted(RECIPE_DIR.glob("*.json")):
+                try:
+                    r = json.loads(p.read_text(encoding="utf-8"))
+                    items.append({"name": r.get("name"), "app": r.get("app"),
+                                  "goal": r.get("goal"), "steps": len(r.get("steps") or [])})
+                except Exception:
+                    continue
+        return out({"ok": True, "recipes": items, "count": len(items)})
+
+    if args.action == "run":
+        p = _recipe_path(args.name)
+        if not p.is_file():
+            die("recipe_not_found", f"没有 recipe：{args.name}", 2)
+        recipe = json.loads(p.read_text(encoding="utf-8"))
+        app = args.app or recipe.get("app")
+        if not app:
+            die("missing_app", "recipe 里没记 app，请用 --app 指定", 4)
+        results = []
+        for i, step in enumerate(recipe.get("steps") or []):
+            op = step.get("op")
+            argv = ["act", "--app", app, "--op", op]
+            for k in ("ref", "text", "key", "value", "direction", "pages", "via", "button", "count"):
+                if step.get(k) is not None:
+                    argv += [f"--{k}", str(step[k])]
+            r = run_ax(argv)
+            results.append({"step": i, "op": op, **r})
+            if not r.get("ok"):
+                return out({"ok": False, "reasonCode": "step_failed", "failedAt": i,
+                            "results": results}, 7)
+        return out({"ok": True, "recipe": args.name, "steps": len(results), "results": results})
+
+    die("bad_args", "recipe 只支持 save / list / run", 4)
+
+
+# ---------------------------------------------------------------- 命令
+
+def _lean(el: dict) -> dict:
+    keep = ("ref", "target_ref", "role", "label", "value", "actions", "enabled", "rect", "score")
+    return {k: el[k] for k in keep if el.get(k) not in (None, "", [], {})}
+
+
+def cmd_doctor(args) -> int:
+    try:
+        binary = find_ax_binary()
+    except SystemExit:
+        return 2
+    health = run_ax(["doctor"])
+    healthy = bool(health.get("ok"))
+    payload = {
+        "ok": healthy,
+        "version": VERSION,
+        "axBinary": str(binary),
+        "accessibility": health.get("accessibility"),
+        "accessibilityUsable": health.get("accessibilityUsable"),
+        "axProbeCode": health.get("axProbeCode"),
+        "screenRecording": health.get("screen_recording"),
+        "macos": health.get("macos"),
+        "decider": "jev" if os.environ.get("TYPESAFE_API_KEY") else "off",
+    }
+    if not healthy:
+        payload["reasonCode"] = health.get("reasonCode") or "permission_missing"
+        payload["hint"] = health.get("hint") or (
+            "到 系统设置 → 隐私与安全性 → 辅助功能，勾选你的终端，然后重试")
+    return out(payload, 0 if healthy else (10 if health.get("reasonCode") == "ax_cannot_complete" else 3))
+
+
+def cmd_apps(args) -> int:
+    return out(run_ax(["apps"]))
+
+
+def cmd_snapshot(args) -> int:
+    snap = snapshot(args.app, max_n=args.max)
+    if args.json:
+        return out(snap)
+    print(f"APP {snap.get('app')} [{snap.get('bundle')}]  WINDOW: {snap.get('window')}")
+    for el in snap.get("elements") or []:
+        pad = "  " * min(el.get("depth", 0), 12)
+        role = (el.get("role") or "").replace("AX", "")
+        line = f"{pad}[{el['ref']}] {role}"
+        if el.get("label"):
+            line += f": {el['label'][:70]}"
+        if el.get("value") and el.get("value") != el.get("label"):
+            line += f" (value: {el['value'][:40]})"
+        if el.get("enabled") is False:
+            line += " [disabled]"
+        if el.get("actions"):
+            line += "  <" + ", ".join(sorted(el["actions"])) + ">"
+        print(line)
+    print(f"# elements {len(snap.get('elements') or [])}")
+    return 0
+
+
+EXIT_CODES = {
+    "stale_ref": 5, "text_not_found": 6, "disabled": 7, "no_geometry": 8,
+    "app_not_found": 2, "no_window": 3, "ax_timeout": 9, "recipe_not_found": 2,
+}
+
+
+def exit_for(payload: dict) -> int:
+    """把失败原因翻成 exit code —— 调用方只写一条分支就能分流。"""
+    if payload.get("ok"):
+        return 0
+    return EXIT_CODES.get(payload.get("reasonCode", ""), 1)
+
+
+def _act(args, op: str, extra: list[str]) -> int:
+    argv = ["act", "--app", args.app, "--op", op] + extra
+    payload = run_ax(argv)
+    return out(payload, exit_for(payload))
+
+
+def cmd_click(args) -> int:
+    extra: list[str] = []
+    if args.ref:
+        extra += ["--ref", args.ref]
+    elif args.text:
+        extra += ["--text", args.text]
+    else:
+        die("bad_args", "click 需要 --ref 或 --text", 4)
+    for k, v in (("via", args.via), ("button", args.button), ("count", args.count)):
+        if v:
+            extra += [f"--{k}", str(v)]
+    if args.no_activate:
+        extra.append("--no-activate")
+    return _act(args, "click", extra)
+
+
+def cmd_type(args) -> int:
+    extra = ["--text", args.text]
+    return _act(args, "type", extra)
+
+
+def cmd_key(args) -> int:
+    return _act(args, "key", ["--key", args.key])
+
+
+def cmd_scroll(args) -> int:
+    extra = ["--ref", args.ref, "--direction", args.direction]
+    if args.pages:
+        extra += ["--pages", str(args.pages)]
+    return _act(args, "scroll", extra)
+
+
+def cmd_set(args) -> int:
+    return _act(args, "set", ["--ref", args.ref, "--value", args.value])
+
+
+def cmd_verify(args) -> int:
+    payload = run_ax(["verify", "--app", args.app, "--ref", args.ref])
+    return out(payload, exit_for(payload))
+
+
+def cmd_remember(args) -> int:
+    """把「这个目标 → 这个元素」记下来，下次零成本命中。
+
+    典型用法：调用方的 LLM 从 decide 的 candidates 里选好之后，回填一次。
+    """
+    snap = snapshot(args.app)
+    elements = snap.get("elements") or []
+    el = next((e for e in elements if e["ref"] == args.ref), None)
+    if not el:
+        die("stale_ref", f"ref {args.ref} 不在当前快照里", 5)
+    memory_store(args.app, args.goal, el, source="explicit")
+    return out({"ok": True, "remembered": {"goal": args.goal, "ref": el["ref"],
+                                           "name": el.get("label") or el.get("value"),
+                                           "role": el.get("role")}})
+
+
+def cmd_decide(args) -> int:
+    started = time.time()
+    result = decide(args.app, args.goal, min_conf=args.min_confidence,
+                    no_decider=args.no_decider, max_opts=args.max)
+    result["totalMs"] = int((time.time() - started) * 1000)
+    if result.get("ok"):
+        return out(result, 0)
+    return out(result, 2)
+
+
+def cmd_do(args) -> int:
+    """decide + act 一次做完，省掉一次进程启动。"""
+    decision = decide(args.app, args.goal, min_conf=args.min_confidence,
+                      no_decider=args.no_decider, max_opts=args.max)
+    if not decision.get("ok"):
+        return out(decision, 2)
+    if decision.get("tier") == "recipe":
+        die("recipe_tier", "命中 recipe，请用 smac recipe run", 3)
+    ref = decision.get("targetRef")
+    if not ref:
+        die("no_target", "决策没有给出目标", 6)
+
+    op = args.op or "click"
+    extra = ["--ref", ref]
+    if op == "type":
+        if not args.text:
+            die("missing_text", "op=type 需要 --text", 4)
+        extra += ["--text", args.text]
+        argv = ["act", "--app", args.app, "--op", "type", "--text", args.text]
+    elif op == "set":
+        if not args.value:
+            die("missing_value", "op=set 需要 --value", 4)
+        argv = ["act", "--app", args.app, "--op", "set", "--ref", ref, "--value", args.value]
+    else:
+        argv = ["act", "--app", args.app, "--op", "click", "--ref", ref]
+
+    acted = run_ax(argv)
+    return out({"ok": bool(acted.get("ok")), "tier": decision.get("tier"),
+                "goal": args.goal, "targetRef": ref,
+                "targetName": decision.get("targetName"),
+                "confidence": decision.get("confidence"),
+                "acted": acted}, exit_for(acted) if isinstance(acted, dict) else 1)
+
+
+def cmd_shot(args) -> int:
+    """按窗口矩形截图。
+
+    不用 ScreenCaptureKit（那需要一个 .app 上下文），直接 `screencapture -R`：
+    启动快、无依赖、能在任何 CLI 里跑。代价是图像里会带上盖在窗口上的其他窗口。
+    """
+    snap = snapshot(args.app)
+    elements = snap.get("elements") or []
+    if not elements:
+        die("empty_snapshot", "拿不到窗口", 3)
+    rect = elements[0].get("rect")
+    if not rect:
+        die("no_geometry", "窗口没有几何信息，无法截图", 8)
+
+    x, y, w, h = int(rect["x"]), int(rect["y"]), int(rect["w"]), int(rect["h"])
+    out_path = os.path.abspath(args.out)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    argv = ["screencapture", "-x"]
+    if args.no_shadow:
+        argv.append("-o")
+    argv += ["-R", f"{x},{y},{w},{h}", out_path]
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    if proc.returncode != 0 or not Path(out_path).is_file():
+        die("shot_failed", (proc.stderr or "screencapture 失败")[:200], 9)
+    return out({"ok": True, "path": out_path, "rect": rect,
+                "bytes": Path(out_path).stat().st_size,
+                "note": "矩形截图会带上覆盖在窗口上的其他窗口；需要纯净窗口图请走 ScreenCaptureKit"})
+
+
+def cmd_bench(args) -> int:
+    runs = args.runs
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        run_ax(["snapshot", "--app", args.app, "--json"])
+        times.append((time.perf_counter() - t0) * 1000)
+    times.sort()
+    return out({"ok": True, "app": args.app, "runs": runs,
+                "p50": round(times[len(times) // 2], 1),
+                "p95": round(times[min(len(times) - 1, int(len(times) * 0.95))], 1),
+                "min": round(times[0], 1), "max": round(times[-1], 1)})
+
+
+# ---------------------------------------------------------------- 入口
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="smac", description="stable-mac: 精准 macOS computer-use")
+    p.add_argument("--version", action="version", version=f"smac {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("doctor").set_defaults(fn=cmd_doctor)
+    sub.add_parser("apps").set_defaults(fn=cmd_apps)
+
+    s = sub.add_parser("snapshot")
+    s.add_argument("--app", required=True)
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--max", type=int, default=4000)
+    s.set_defaults(fn=cmd_snapshot)
+
+    c = sub.add_parser("click")
+    c.add_argument("--app", required=True)
+    c.add_argument("--ref")
+    c.add_argument("--text")
+    c.add_argument("--via", default="auto", choices=["auto", "ax", "mouse"])
+    c.add_argument("--button", choices=["left", "right"])
+    c.add_argument("--count", type=int)
+    c.add_argument("--no-activate", action="store_true")
+    c.set_defaults(fn=cmd_click)
+
+    t = sub.add_parser("type")
+    t.add_argument("--app", required=True)
+    t.add_argument("--text", required=True)
+    t.set_defaults(fn=cmd_type)
+
+    k = sub.add_parser("key")
+    k.add_argument("--app", required=True)
+    k.add_argument("--key", required=True)
+    k.set_defaults(fn=cmd_key)
+
+    sc = sub.add_parser("scroll")
+    sc.add_argument("--app", required=True)
+    sc.add_argument("--ref", required=True)
+    sc.add_argument("--direction", default="down", choices=["up", "down", "left", "right"])
+    sc.add_argument("--pages", type=float, default=1.0)
+    sc.set_defaults(fn=cmd_scroll)
+
+    st = sub.add_parser("set")
+    st.add_argument("--app", required=True)
+    st.add_argument("--ref", required=True)
+    st.add_argument("--value", required=True)
+    st.set_defaults(fn=cmd_set)
+
+    v = sub.add_parser("verify")
+    v.add_argument("--app", required=True)
+    v.add_argument("--ref", required=True)
+    v.set_defaults(fn=cmd_verify)
+
+    sh = sub.add_parser("shot")
+    sh.add_argument("--app", required=True)
+    sh.add_argument("--out", required=True)
+    sh.add_argument("--no-shadow", action="store_true")
+    sh.set_defaults(fn=cmd_shot)
+
+    rm = sub.add_parser("remember")
+    rm.add_argument("--app", required=True)
+    rm.add_argument("--goal", required=True)
+    rm.add_argument("--ref", required=True)
+    rm.set_defaults(fn=cmd_remember)
+
+    d = sub.add_parser("decide")
+    d.add_argument("--app", required=True)
+    d.add_argument("--goal", required=True)
+    d.add_argument("--max", type=int, default=8)
+    d.add_argument("--min-confidence", type=float, default=CONFIDENCE_HIGH)
+    d.add_argument("--no-decider", action="store_true")
+    d.set_defaults(fn=cmd_decide)
+
+    do = sub.add_parser("do")
+    do.add_argument("--app", required=True)
+    do.add_argument("--goal", required=True)
+    do.add_argument("--op", default="click", choices=["click", "type", "set"])
+    do.add_argument("--text")
+    do.add_argument("--value")
+    do.add_argument("--max", type=int, default=8)
+    do.add_argument("--min-confidence", type=float, default=CONFIDENCE_HIGH)
+    do.add_argument("--no-decider", action="store_true")
+    do.set_defaults(fn=cmd_do)
+
+    r = sub.add_parser("recipe")
+    r.add_argument("action", choices=["save", "list", "run"])
+    r.add_argument("name", nargs="?")
+    r.add_argument("--app")
+    r.add_argument("--goal", default="")
+    r.set_defaults(fn=cmd_recipe)
+
+    b = sub.add_parser("bench")
+    b.add_argument("--app", required=True)
+    b.add_argument("--runs", type=int, default=10)
+    b.set_defaults(fn=cmd_bench)
+
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
