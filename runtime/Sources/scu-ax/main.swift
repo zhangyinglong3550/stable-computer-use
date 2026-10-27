@@ -383,6 +383,31 @@ struct Snapshot {
     var cycles: Int = 0
 }
 
+/// 找这个 app 的窗口在 CGWindowList 里的 ID。
+/// 用 optionAll：窗口在别的 Space、或者被完全盖住时，OnScreenOnly 根本看不到它。
+func cgWindowId(pid: pid_t, like bounds: CGRect?) -> CGWindowID? {
+    let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+    guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+        return nil
+    }
+    var best: (CGWindowID, CGFloat) = (0, .greatestFiniteMagnitude)
+    for w in list {
+        guard (w[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+              (w[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+              let num = (w[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+              let b = w[kCGWindowBounds as String] as? [String: Any],
+              let ww = b["Width"] as? CGFloat, let hh = b["Height"] as? CGFloat,
+              ww > 100, hh > 100 else { continue }
+        if let target = bounds {
+            let dx = abs(ww - target.width) + abs(hh - target.height)
+            if dx < best.1 { best = (num, dx) }
+        } else if best.0 == 0 {
+            best = (num, 0)
+        }
+    }
+    return best.0 == 0 ? nil : best.0
+}
+
 func windowRect(_ w: AXUIElement) -> CGRect? {
     var p = CGPoint.zero, sz = CGSize.zero
     if let pv = attr(w, kAXPositionAttribute) { AXValueGetValue(pv as! AXValue, .cgPoint, &p) }
@@ -467,6 +492,7 @@ func toJSON(_ s: Snapshot) -> [String: Any] {
     }
     if s.keep.indices.contains(0) && s.keep[0] { walk(0) }
     var payload: [String: Any] = ["ok": true,
+                                  "pid": Int(s.app.app.processIdentifier),
                                   "app": s.app.app.localizedName ?? "",
                                   "bundle": s.app.app.bundleIdentifier ?? "",
                                   "window": s.title, "elements": out]
@@ -1480,6 +1506,19 @@ case "act":
     }
 
     die("unknown --op \(op)", code: 4)
+
+case "winid":
+    guard let appSpec = args.flag("app") else { die("missing --app", code: 4) }
+    guard let app = resolveAppSafe(appSpec) else {
+        emit(["ok": false, "reasonCode": "app_not_found", "app": appSpec]); exit(2)
+    }
+    let bounds = targetWindow(app).flatMap { windowRect($0) }
+    guard let id = cgWindowId(pid: app.app.processIdentifier, like: bounds) else {
+        emit(["ok": false, "reasonCode": "no_cg_window", "app": appSpec]); exit(3)
+    }
+    var out: [String: Any] = ["ok": true, "id": id, "pid": Int(app.app.processIdentifier)]
+    if let b = bounds { out["bounds"] = ["x": b.origin.x, "y": b.origin.y, "w": b.width, "h": b.height] }
+    emit(out)
 
 case "verify":
     guard let appSpec = args.flag("app"), let ref = args.flag("ref") else {

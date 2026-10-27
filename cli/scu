@@ -925,31 +925,45 @@ def cmd_do(args) -> int:
 
 
 def cmd_shot(args) -> int:
-    """按窗口矩形截图。
+    """截图。
 
-    不用 ScreenCaptureKit（那需要一个 .app 上下文），直接 `screencapture -R`：
-    启动快、无依赖、能在任何 CLI 里跑。代价是图像里会带上盖在窗口上的其他窗口。
+    优先用 `screencapture -l <窗口ID>`：**按窗口抓，不受 Space 和遮挡影响**。
+    没有窗口 ID 时退回 `-R <矩形>`，但那个会把盖在上面的窗口一起拍进去。
+
+    用 `-l` 时，`--crop` 的坐标是**窗口内**的图像像素（原点 = 窗口左上角）。
     """
     snap = snapshot(args.app)
     elements = snap.get("elements") or []
     if not elements:
         die("empty_snapshot", "拿不到窗口", 3)
     rect = elements[0].get("rect")
-    if not rect:
-        die("no_geometry", "窗口没有几何信息，无法截图", 8)
-
-    x, y, w, h = int(rect["x"]), int(rect["y"]), int(rect["w"]), int(rect["h"])
+    pid = snap.get("pid")
     out_path = os.path.abspath(args.out)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    win_id = None
+    if pid is not None:
+        w = run_ax(["winid", "--app", args.app])
+        if w.get("ok"):
+            win_id = w.get("id")
+
     argv = ["screencapture", "-x"]
-    if args.no_shadow:
-        argv.append("-o")
-    argv += ["-R", f"{x},{y},{w},{h}", out_path]
+    if win_id is not None:
+        argv += ["-o", "-l", str(win_id)]
+    else:
+        if not rect:
+            die("no_geometry", "窗口没有几何信息，无法截图", 8)
+        x, y, w, h = int(rect["x"]), int(rect["y"]), int(rect["w"]), int(rect["h"])
+        if args.no_shadow:
+            argv.append("-o")
+        argv += ["-R", f"{x},{y},{w},{h}"]
+    argv.append(out_path)
+
     proc = subprocess.run(argv, capture_output=True, text=True)
     if proc.returncode != 0 or not Path(out_path).is_file():
         die("shot_failed", (proc.stderr or "screencapture 失败")[:200], 9)
 
-    # 裁剪 + 缩放：给模型看的图越小越快（token 也少）
+    # 裁剪 + 缩放：给模型看的图越小越快
     sips_argv = []
     if args.crop:
         try:
@@ -958,18 +972,36 @@ def cmd_shot(args) -> int:
             die("bad_args", "--crop 格式为 x,y,w,h（图像像素）", 4)
         sips_argv += ["-c", str(ch), str(cw), "--cropOffset", str(cy), str(cx)]
     if args.scale and args.scale != 1.0:
-        sips_argv += ["-Z", str(int(max(w, h) * args.scale))]
+        base_w = w if win_id is None else int((rect or {}).get("w", w))
+        sips_argv += ["-Z", str(int(max(base_w, 1) * 2 * args.scale))]
     if sips_argv:
         subprocess.run(["sips", *sips_argv, out_path, "--out", out_path],
                        capture_output=True, text=True)
-    # Retina 屏上 screencapture -R 输出的是 2x 像素，而 AX 矩形是点。
-    # 不告诉调用方这个比例，从截图里量出来的坐标就会差一倍。
-    scale = _image_scale(out_path, w, h)
-    return out({"ok": True, "path": out_path, "rect": rect, "scale": scale,
-                "hint": (f"图像像素 = 屏幕点 × {scale}；点击时请用屏幕坐标点："
-                         f"screen_x = {x} + img_x / {scale}, screen_y = {y} + img_y / {scale}"),
-                "bytes": Path(out_path).stat().st_size,
-                "note": "矩形截图会带上覆盖在窗口上的其他窗口；需要纯净窗口图请走 ScreenCaptureKit"})
+
+    img_w = img_h = 0
+    scale = 1.0
+    try:
+        with open(out_path, "rb") as f:
+            head = f.read(33)
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            import struct
+            img_w, img_h = struct.unpack(">II", head[16:24])
+            if rect and rect["w"]:
+                scale = round(img_w / rect["w"], 3)
+    except Exception:
+        pass
+
+    mode = "window" if win_id is not None else "rect"
+    return out({
+        "ok": True, "path": out_path, "rect": rect, "windowId": win_id, "mode": mode,
+        "image": {"w": img_w, "h": img_h}, "scale": scale,
+        "cropOrigin": "window" if mode == "window" else "screen",
+        "hint": (f"图像像素 = 窗口点 × {scale}；--crop 用图像像素，原点在"
+                 + ("窗口左上角" if mode == "window" else "屏幕左上角")),
+        "bytes": Path(out_path).stat().st_size,
+        "note": ("" if mode == "window"
+                 else "矩形截图会带上盖在窗口上的其他窗口；拿不到窗口 ID 时才会这样"),
+    })
 
 
 def _image_scale(path: str, point_w: int, point_h: int) -> float:
