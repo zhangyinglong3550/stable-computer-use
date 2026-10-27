@@ -204,6 +204,57 @@ Assertion failed: (did_initialize), function CGS_REQUIRE_INIT
 
 ---
 
+## 10.5 AX 不可用：三种完全不同的情况
+
+排查时踩了很久，值得单独记下来。三种情况表面都像"权限没了"，实际处理方式完全不同。
+
+### A. `AXIsProcessTrusted()` 为 false —— 真的没授权
+
+去 系统设置 → 隐私与安全性 → 辅助功能 勾选终端。标准路径，无歧义。
+
+### B. 系统级探针返回 `-25204` —— **假阴性，不是故障**
+
+```swift
+AXUIElementCreateSystemWide() + kAXFocusedApplicationAttribute  →  -25204 (cannotComplete)
+```
+
+实测在**一切正常**的时候这个调用也会稳定失败。所以**绝对不能拿它当健康探针** ——
+第一版 `doctor` 就是这么写的，导致工具明明能用却报"不可用"。
+
+正确探针：对**某个具体 app** 读一次 `AXRole`：
+
+```swift
+AXUIElementCreateApplication(front.pid) + kAXRoleAttribute  →  0 (success)
+```
+
+现在已经改成这样。如果用 `-25204` 判断健康，会遇到"doctor 说不行但 snapshot 正常"的怪现象。
+
+### C. 窗口全部变成 app 代理 —— AX 服务真的无响应
+
+症状很有辨识度：
+
+| 现象 | 说明 |
+|---|---|
+| `kAXWindowsAttribute` 里每个元素 `CFEqual(app, w) == true` | 拿回来的是 app 元素本身 |
+| 这些"窗口"没有 `AXPosition` / `AXSize` / `AXCloseButton` | 不是真窗口 |
+| 所有 app 同时这样 | 不是某个 app 的问题 |
+| 早先能用的旧二进制也卡住 | 排除代码回归 |
+
+实测触发条件：**显示器休眠 / 长时间无人操作**。约 36 分钟无操作后进入这个状态，
+用户回到机器后自行恢复。会话本身没有锁定（`CGSessionCopyCurrentDictionary()` 里
+没有 `CGSSessionScreenIsLocked`，`kCGSSessionOnConsoleKey = 1`）。
+
+处理：
+- 工具侧**快速失败**，报 `no_window` 或 `ax_cannot_complete`（exit 10），
+  而不是往桌面里递归——第一版就是这么炸到 4000 个节点的
+- 窗口校验必须检查 role ∈ {AXWindow, AXSheet, AXDialog}，不能拿到什么就用什么
+
+### 顺带：为什么 Codex 要做一个签名 `.app`
+
+同一类问题的产品化答案。Codex 的 `CUALockScreenGuardian` 专门处理锁屏，
+错误文案写得很直白："The Mac is locked. Unlock it before reading accessibility text."
+这印证了 AX 的可用性依赖 GUI 会话/显示器状态，而不是一次授权终身有效。
+
 ## 11. 没做的和为什么
 
 | 没做 | 原因 |

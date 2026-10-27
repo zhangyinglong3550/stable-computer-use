@@ -235,7 +235,8 @@ export TYPESAFE_API_KEY=...
 | **矩形截图会串窗口** | `scu shot` 用 `screencapture -R`，盖在目标窗口上的其他窗口会被拍进去。跨 Space / 多屏时可能拍到别的内容。需要纯净窗口图得走 ScreenCaptureKit（要一个 .app 上下文） |
 | **无文字容器排最后** | 兜底候选优先给有文字的元素，纯图标按钮可能选不中，用 ref 或坐标 |
 | **鼠标点击需要窗口在前台** | `--via ax` 可以不动鼠标不抢焦点，但不是所有控件都支持 AXPress |
-| **`AXIsProcessTrusted()` 会骗人** | 它返回 `true` 不代表真能读。实测遇到过：TCC 显示已授权，但 AX 返回 `-25204`（cannotComplete），`kAXWindowsAttribute` 把 app 元素本身当成"窗口"返回。常见于**屏幕锁定**或**非活动 GUI 会话**。`scu doctor` 会做真实探针，`accessibilityUsable` 才是可信的 |
+| **`AXIsProcessTrusted()` 会骗人** | 返回 `true` 不代表真能读。另外**不要**用系统级的 `kAXFocusedApplicationAttribute` 当健康探针 —— 实测正常状态下它也会稳定返回 `-25204`，是假阴性。`scu doctor` 已改成对具体 app 做探针，看 `accessibilityUsable` |
+| **长时间无操作 / 显示器休眠后 AX 会无响应** | 症状：所有 app 的窗口都变成 app 元素本身（没有位置/尺寸），旧二进制也会卡住。回到机器后自行恢复。工具会报 `ax_cannot_complete`(exit 10) 而不是崩溃 |
 | 窗口最小化 / 在别的 Space 时可能取不到 | 这时返回 `no_window`，不是崩溃。先把窗口调出来 |
 | **只做 macOS** | 别的平台 AX/UIA 语义差太多，硬套一个抽象是负担 |
 
