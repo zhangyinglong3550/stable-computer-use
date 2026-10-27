@@ -987,6 +987,35 @@ def _image_scale(path: str, point_w: int, point_h: int) -> float:
     return 1.0
 
 
+def cmd_daemon(args) -> int:
+    """管理常驻 daemon。重建 scu-ax 之后必须 restart，否则跑的是旧逻辑。"""
+    if args.action == "status":
+        alive = _daemon_alive()
+        info = _sock_call({"cmd": "ping"}, timeout=2.0) if alive else None
+        return out({"ok": alive, "running": alive, "socket": SOCK_PATH, "info": info})
+
+    if args.action == "stop":
+        _sock_call({"cmd": "shutdown"}, timeout=2.0)
+        try:
+            os.unlink(SOCK_PATH)
+        except FileNotFoundError:
+            pass
+        return out({"ok": True, "stopped": True})
+
+    if args.action in ("start", "restart"):
+        if args.action == "restart":
+            _sock_call({"cmd": "shutdown"}, timeout=2.0)
+            try:
+                os.unlink(SOCK_PATH)
+            except FileNotFoundError:
+                pass
+        started = ensure_daemon()
+        return out({"ok": started, "running": _daemon_alive(), "socket": SOCK_PATH},
+                   0 if started else 2)
+
+    die("bad_args", "daemon 支持 status / start / stop / restart", 4)
+
+
 def cmd_js(args) -> int:
     """code mode：写一段 JS 一次跑完一整串动作。
 
@@ -1187,6 +1216,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--app")
     r.add_argument("--goal", default="")
     r.set_defaults(fn=cmd_recipe)
+
+    dm = sub.add_parser("daemon", help="管理常驻 daemon：status / start / stop / restart")
+    dm.add_argument("action", choices=["status", "start", "stop", "restart"])
+    dm.set_defaults(fn=cmd_daemon)
 
     js = sub.add_parser("js", help="code mode：写一段 JS 跑完整串动作（最快）")
     js.add_argument("file", nargs="?")
