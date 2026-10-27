@@ -979,7 +979,7 @@ def cmd_batch(args) -> int:
             processed += 1
             continue
         cmd = req.pop("cmd", None)
-        if cmd not in ("click", "set", "type", "snapshot", "ping"):
+        if cmd not in ("click", "set", "type", "snapshot", "ping", "key", "activate"):
             out({"ok": False, "reasonCode": "unsupported_cmd", "cmd": cmd}, 4)
             failed += 1
             continue
@@ -1013,6 +1013,8 @@ def cmd_bench(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="scu", description="stable-computer-use: 精准 macOS computer-use")
     p.add_argument("--version", action="version", version=f"scu {VERSION}")
+    p.add_argument("--fast", action="store_true",
+                   help="砍掉鼠标/激活的保守等待（约省 100ms）。界面慢时别用")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor").set_defaults(fn=cmd_doctor)
@@ -1129,7 +1131,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if getattr(args, "fast", False):
+        os.environ["SCU_WAIT_SCALE"] = "0.25"
     return args.fn(args)
 
 

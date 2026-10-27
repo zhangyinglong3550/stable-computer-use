@@ -329,6 +329,19 @@ func isWindow(_ el: AXUIElement) -> Bool {
     return WINDOW_ROLES.contains(role)
 }
 
+/// 不 exit 的版本 —— daemon 里绝不能用会退出的解析，否则一个坏请求就把服务打死。
+func resolveAppSafe(_ spec: String) -> AppRef? {
+    let running = NSWorkspace.shared.runningApplications
+    let match = running.first { $0.bundleIdentifier == spec }
+        ?? running.first { $0.localizedName == spec }
+        ?? running.first { ($0.bundleIdentifier ?? "").lowercased().contains(spec.lowercased()) }
+        ?? running.first { ($0.localizedName ?? "").lowercased().contains(spec.lowercased()) }
+    guard let app = match else { return nil }
+    let ax = AXUIElementCreateApplication(app.processIdentifier)
+    AXUIElementSetMessagingTimeout(ax, 2.0)
+    return AppRef(app: app, ax: ax)
+}
+
 func targetWindow(_ a: AppRef) -> AXUIElement {
     if let w = attr(a.ax, kAXFocusedWindowAttribute) {
         let el = w as! AXUIElement
@@ -455,29 +468,44 @@ func toJSON(_ s: Snapshot) -> [String: Any] {
 
 // MARK: - 输入合成
 
+/// 等待倍率：1.0 = 稳（默认），0.25 = 快。环境变量 SCU_WAIT_SCALE 可覆盖。
+func waitScale() -> Double {
+    if let v = ProcessInfo.processInfo.environment["SCU_WAIT_SCALE"], let d = Double(v), d > 0 {
+        return d
+    }
+    return 1.0
+}
+
+func nap(_ ms: Double) {
+    let scaled = ms * waitScale()
+    if scaled >= 1 { usleep(useconds_t(scaled * 1000)) }
+}
+
 func activate(_ a: AppRef) {
     if #available(macOS 14.0, *) {
         a.app.activate()
     } else {
         a.app.activate(options: [.activateIgnoringOtherApps])
     }
-    usleep(60_000)
+    nap(35)
 }
 
-func mouseClick(at p: CGPoint, button: CGMouseButton = .left, count: Int = 1, holdMs: Int = 40) {
+func mouseClick(at p: CGPoint, button: CGMouseButton = .left, count: Int = 1, holdMs: Int = 12) {
     let src = CGEventSource(stateID: .hidSystemState)
     let (down, up): (CGEventType, CGEventType) = button == .right
         ? (.rightMouseDown, .rightMouseUp) : (.leftMouseDown, .leftMouseUp)
+    // 只保留事件顺序所需的最小间隔。
+    // 实测/Codex 的做法一致：输入立刻发，等待放在「取状态」那一侧自适应做。
     CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: button)?
         .post(tap: .cghidEventTap)
-    usleep(30_000)
+    nap(2)
     for _ in 0..<max(1, count) {
         CGEvent(mouseEventSource: src, mouseType: down, mouseCursorPosition: p, mouseButton: button)?
             .post(tap: .cghidEventTap)
-        usleep(useconds_t(holdMs * 1000))
+        nap(Double(holdMs))
         CGEvent(mouseEventSource: src, mouseType: up, mouseCursorPosition: p, mouseButton: button)?
             .post(tap: .cghidEventTap)
-        usleep(30_000)
+        nap(2)
     }
 }
 
@@ -532,6 +560,32 @@ func pressKey(_ chord: String) {
     usleep(15_000)
 }
 
+/// 长文本走剪贴板粘贴：逐字合成是 4ms/字，26 个字就 100ms+。
+/// 粘贴是一次 ⌘V，而且不会因为输入法状态丢字。
+func pasteText(_ text: String) -> Bool {
+    let pb = NSPasteboard.general
+    let saved = pb.string(forType: .string)
+    pb.clearContents()
+    pb.setString(text, forType: .string)
+    usleep(20_000)
+    let src = CGEventSource(stateID: .hidSystemState)
+    let vKey = CGKeyCode(9)   // v
+    let down = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: true)
+    let up = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: false)
+    down?.flags = .maskCommand
+    up?.flags = .maskCommand
+    down?.post(tap: .cghidEventTap)
+    usleep(15_000)
+    up?.post(tap: .cghidEventTap)
+    usleep(60_000)
+    // 还原用户原来的剪贴板
+    if let s = saved {
+        pb.clearContents()
+        pb.setString(s, forType: .string)
+    }
+    return true
+}
+
 func typeText(_ text: String) {
     let src = CGEventSource(stateID: .hidSystemState)
     for scalar in text {
@@ -542,7 +596,7 @@ func typeText(_ text: String) {
         guard let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else { continue }
         up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         up.post(tap: .cghidEventTap)
-        usleep(4_000)
+        nap(1.5)
     }
 }
 
@@ -833,6 +887,11 @@ func handleClient(_ fd: Int32) {
 
     case "snapshot":
         let maxN = req["max"] as? Int ?? 4000
+        guard resolveAppSafe(appSpec) != nil else {
+            writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec,
+                           "running": NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }.sorted().prefix(40).map { $0 }])
+            return
+        }
         let snap = snapshot(appSpec, maxN: maxN)
         cacheStore(snap)
         var out = toJSON(snap)
@@ -853,8 +912,21 @@ func handleClient(_ fd: Int32) {
                 r = ["ok": false, "reasonCode": "stale_ref", "ref": ref]
             }
             writeLine(fd, r)
+        } else if let x = req["x"] as? Double, let y = req["y"] as? Double,
+                  (req["mouse"] as? Bool) == true {
+            // 真鼠标点击（Electron 等没有 AX 的场景）。只在必要时激活，避免每次 35ms。
+            guard let app = resolveAppSafe(appSpec) else {
+                writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
+            }
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
+                activate(app)
+            }
+            mouseClick(at: CGPoint(x: x, y: y), count: (req["count"] as? Int) ?? 1)
+            writeLine(fd, ["ok": true, "op": "click", "via": "daemon-mouse", "x": x, "y": y])
         } else if let x = req["x"] as? Double, let y = req["y"] as? Double {
-            let app = resolveApp(appSpec)
+            guard let app = resolveAppSafe(appSpec) else {
+                writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
+            }
             guard let hit = elementAtPoint(app.app.processIdentifier, CGPoint(x: x, y: y)),
                   let t = pressable(hit) else {
                 writeLine(fd, ["ok": false, "reasonCode": "no_ax_action_at_point"])
@@ -878,7 +950,9 @@ func handleClient(_ fd: Int32) {
         guard let t = req["text"] as? String else {
             writeLine(fd, ["ok": false, "reasonCode": "bad_args"]); return
         }
-        let app = resolveApp(appSpec)
+        guard let app = resolveAppSafe(appSpec) else {
+            writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
+        }
         var focused: CFTypeRef?
         if AXUIElementCopyAttributeValue(app.ax, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
            let el = focused as! AXUIElement?, writeText(into: el, t) {
@@ -886,6 +960,26 @@ func handleClient(_ fd: Int32) {
         } else {
             writeLine(fd, ["ok": false, "reasonCode": "needs_takeover"])
         }
+
+    case "activate":
+        guard let app = resolveAppSafe(appSpec) else {
+            writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
+        }
+        activate(app)
+        writeLine(fd, ["ok": true, "op": "activate", "app": appSpec])
+
+    case "key":
+        guard let k = req["key"] as? String else {
+            writeLine(fd, ["ok": false, "reasonCode": "bad_args"]); return
+        }
+        guard let app = resolveAppSafe(appSpec) else {
+            writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
+        }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
+            activate(app)
+        }
+        pressKey(k)
+        writeLine(fd, ["ok": true, "op": "key", "key": k])
 
     case "invalidate":
         cache.removeAll(); cacheMeta.removeAll(); cacheApp = ""
@@ -1162,8 +1256,13 @@ case "act":
         // AX 写不进去 —— 需要真键盘，必须接管
         requireTakeOver(args, why: "键盘输入需要目标窗口获得焦点")
         activate(app)
-        typeText(t)
-        emit(["ok": true, "op": "type", "via": "keyboard", "chars": t.count])
+        if t.count > 8 && !args.has("no-paste") {
+            _ = pasteText(t)
+            emit(["ok": true, "op": "type", "via": "paste", "chars": t.count])
+        } else {
+            typeText(t)
+            emit(["ok": true, "op": "type", "via": "keyboard", "chars": t.count])
+        }
         break
     }
 
