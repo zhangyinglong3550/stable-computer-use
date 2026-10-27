@@ -317,6 +317,7 @@ func resolveApp(_ spec: String) -> AppRef {
     guard let app = match else { die("app_not_found: \(spec)", code: 2) }
     let ax = AXUIElementCreateApplication(app.processIdentifier)
     AXUIElementSetMessagingTimeout(ax, 2.0)
+    tryEnableManualAX(app.processIdentifier, ax)
     return AppRef(app: app, ax: ax)
 }
 
@@ -329,6 +330,18 @@ func isWindow(_ el: AXUIElement) -> Bool {
     return WINDOW_ROLES.contains(role)
 }
 
+/// 已经尝试过强制开启无障碍树的 app（按 pid）
+var manualAxTried = Set<pid_t>()
+
+/// Chromium/Electron 系应用有个开关：设 AXManualAccessibility=true 会强制它构建无障碍树。
+/// VS Code 这类有效；Notion 这类把内容画在 canvas 里的无效（实测 64→64 节点）。
+/// 无害，所以每个 app 试一次，能开就赚。
+func tryEnableManualAX(_ pid: pid_t, _ ax: AXUIElement) {
+    if manualAxTried.contains(pid) { return }
+    manualAxTried.insert(pid)
+    _ = AXUIElementSetAttributeValue(ax, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+}
+
 /// 不 exit 的版本 —— daemon 里绝不能用会退出的解析，否则一个坏请求就把服务打死。
 func resolveAppSafe(_ spec: String) -> AppRef? {
     let running = NSWorkspace.shared.runningApplications
@@ -339,6 +352,7 @@ func resolveAppSafe(_ spec: String) -> AppRef? {
     guard let app = match else { return nil }
     let ax = AXUIElementCreateApplication(app.processIdentifier)
     AXUIElementSetMessagingTimeout(ax, 2.0)
+    tryEnableManualAX(app.processIdentifier, ax)
     return AppRef(app: app, ax: ax)
 }
 

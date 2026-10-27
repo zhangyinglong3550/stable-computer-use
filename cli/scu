@@ -930,6 +930,20 @@ def cmd_shot(args) -> int:
     proc = subprocess.run(argv, capture_output=True, text=True)
     if proc.returncode != 0 or not Path(out_path).is_file():
         die("shot_failed", (proc.stderr or "screencapture 失败")[:200], 9)
+
+    # 裁剪 + 缩放：给模型看的图越小越快（token 也少）
+    sips_argv = []
+    if args.crop:
+        try:
+            cx, cy, cw, ch = [int(v) for v in args.crop.split(",")]
+        except ValueError:
+            die("bad_args", "--crop 格式为 x,y,w,h（图像像素）", 4)
+        sips_argv += ["-c", str(ch), str(cw), "--cropOffset", str(cy), str(cx)]
+    if args.scale and args.scale != 1.0:
+        sips_argv += ["-Z", str(int(max(w, h) * args.scale))]
+    if sips_argv:
+        subprocess.run(["sips", *sips_argv, out_path, "--out", out_path],
+                       capture_output=True, text=True)
     # Retina 屏上 screencapture -R 输出的是 2x 像素，而 AX 矩形是点。
     # 不告诉调用方这个比例，从截图里量出来的坐标就会差一倍。
     scale = _image_scale(out_path, w, h)
@@ -1111,6 +1125,8 @@ def build_parser() -> argparse.ArgumentParser:
     sh.add_argument("--app", required=True)
     sh.add_argument("--out", required=True)
     sh.add_argument("--no-shadow", action="store_true")
+    sh.add_argument("--crop", help="裁一块：x,y,w,h（图像像素）。模型只看这一块，快很多")
+    sh.add_argument("--scale", type=float, default=1.0, help="缩放比例，例如 0.5")
     sh.set_defaults(fn=cmd_shot)
 
     rm = sub.add_parser("remember")

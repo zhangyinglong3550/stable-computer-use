@@ -28,60 +28,33 @@ scu doctor
 所以：
 
 - **用户在用电脑时，不要做会改界面的操作**。先只读，等他停手
-- **不要**随便加 `--take-over`。只有用户明确说"你直接操作吧/我不在用"时才加
-- 被 `needs_takeover` / `user_active` 拒绝时，**不要绕过去**：换 API 路径，或者问用户
-- 做写操作前先 `snapshot` 看清楚，别猜
-- 操作完不要假设成功，重新 `snapshot` 确认
+- **不要**随便做会激活窗口的动作。只有用户明确说"你直接操作吧/我不在用"时才做
+- 做写操作前先 `state()` 看清楚，别猜
+- 操作完不要假设成功，重新 `state()` 确认
+
+## 用之前先看一眼
 
 ```bash
-scu click --app X --ref R          # ✅ 默认
-scu click --app X --xy 100,200     # ✅ 命中测试，仍不动鼠标
-scu click --app X --xy 100,200 --via mouse --take-over   # ⚠️ 会打断用户，先问
+scu doctor
 ```
 
-## 基本循环
+`accessibilityUsable` 必须是 `true`。只是 `accessibility: true` 不够。
+
+## 默认写法：一段代码跑完
+
+**不要一步一条命令。** 一条命令付一次进程启动（约 75ms），动作本身只要 0.16ms。
 
 ```bash
-scu snapshot --app "Finder"        # 1. 看：元素表 + ref
-scu click --app "Finder" --ref 3netay   # 2. 做
-scu snapshot --app "Finder"        # 3. 再看：确认真的变了
+scu js -e '
+const app = await scu.getApp("com.tencent.WeWorkMac");
+const st = await app.state({json: true});          // 拿结构
+const row = st.elements.find(e => (e.label||"").includes("文件传输助手") && e.rect);
+await app.click({ x: row.rect.x + row.rect.w/2, y: row.rect.y + row.rect.h/2, mouse: true });
+await scu.sleep(400);
+await app.type("你好");
+await app.key("Return");
+'
 ```
-
-动作不返回结果，**必须重新 snapshot 确认**。别假设点成功了。
-
-## 选元素：先问 decide，别自己猜
-
-```bash
-scu decide --app "Finder" --goal '点击"搜索"'
-```
-
-它会告诉你走到了哪一级（`tier`）、置信度、以及目标 ref：
-
-| tier | 含义 | 你要做的 |
-|---|---|---|
-| `exact` / `memory` / `recipe` | 本地确定命中，0 成本 | 直接用 `targetRef` |
-| `lexical` + `gate=high` | 本地打分很有把握 | 用 `targetRef` |
-| `lexical` + `gate=medium/low` | 本地不确定 | 看 `candidates` 自己选 |
-| `jev` | JEV 选好了 | 用 `targetRef`；`gate` 不是 high 就先 verify |
-| `handoff` | 本地说不准，交给你 | 从 `candidates` 里选一个 |
-
-**`handoff` 也是有用信息**：`bestGuess` 是它的最佳猜测，`candidates` 是排序好的候选。别丢掉这些重新造轮子。
-
-### 关键：你选完要教它
-
-```bash
-scu remember --app "Finder" --goal "回到上一个文件夹" --ref mkq0ob
-```
-
-教一次，以后这个目标就是 `tier=memory`、98ms、零模型。**重复任务不做这一步是浪费。**
-
-## 精准操作要点
-
-- **优先 `--ref`**，其次 `--text`，最后才坐标
-- **控件优先 `--via ax`**：走 AXPress，不动鼠标也不抢焦点，用户能继续干自己的事
-- **动作前 `verify`**：`scu verify --app A --ref R` → 还在吗、enabled 吗、位置变了吗
-- **`stale_ref` 不是错误，是提示**：重新 snapshot 拿新 ref 再重试
-- **文字节点自动解析到祖先**：Snapshot JSON 里 `target_ref` 已经是最近的可点祖先，`scu click --ref` 用 `ref` 也行（内部会解析）
 
 ## 默认用 code mode，别一步一条命令
 
@@ -111,8 +84,19 @@ console.log(await app.state());        // 再看一眼
 | `await app.type("你好")` | 优先 AX 直写 |
 | `await app.key("super+s")` | 菜单项优先，否则真键盘 |
 | `await app.set(ref, "v")` | 直接写值 |
-| `await app.shot("/tmp/a.png")` | 截图 |
+| `await app.shot("/tmp/a.png")` | 截图（配合 `scu shot --crop` 只看一块） |
 | `scu.sleep(ms)` / `scu.log(...)` | 等待 / 输出 |
+
+## 看截图要"裁小"
+
+整窗截图 412KB，裁一块只有 11KB。**模型看图的时间跟图大小成正比**，所以先裁再问：
+
+```bash
+scu shot --app X --out /tmp/a.png --crop 520,40,700,120   # x,y,w,h（图像像素）
+scu shot --app X --out /tmp/a.png --scale 0.5              # 或者整体缩小
+```
+
+注意：`-R` 矩形截图会带上**盖在上面的其他窗口**，不是纯净窗口图。
 
 ## 也可以用 batch（JSONL）
 
