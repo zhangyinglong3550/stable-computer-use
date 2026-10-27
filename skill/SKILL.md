@@ -83,7 +83,40 @@ scu remember --app "Finder" --goal "回到上一个文件夹" --ref mkq0ob
 - **`stale_ref` 不是错误，是提示**：重新 snapshot 拿新 ref 再重试
 - **文字节点自动解析到祖先**：Snapshot JSON 里 `target_ref` 已经是最近的可点祖先，`scu click --ref` 用 `ref` 也行（内部会解析）
 
-## 要连续做很多步时，用 batch
+## 默认用 code mode，别一步一条命令
+
+一步一条命令，每条都要付一次进程启动（75ms）。**连续动作必须写成一段代码**，一次跑完：
+
+```bash
+scu js -e '
+const app = await scu.getApp("com.apple.finder");
+console.log(await app.state());        // 先看一眼
+await app.click({ref: "abc123"});      // AX 动作，不动鼠标
+await app.key("super+n");
+console.log(await app.state());        // 再看一眼
+'
+```
+
+每个动作 **0.16–0.7ms**，比逐个调用快两个数量级。
+
+### API
+
+| 写法 | 作用 |
+|---|---|
+| `await scu.getApp("Finder")` | 绑定 app（名字或 bundle id） |
+| `await app.state()` | 紧凑文本树，直接打印 |
+| `await app.click({ref})` | AX 动作，不动鼠标不抢焦点 |
+| `await app.click({x,y})` | 命中测试 → AXPress |
+| `await app.click({x,y,mouse:true})` | 真鼠标（会激活窗口） |
+| `await app.type("你好")` | 优先 AX 直写 |
+| `await app.key("super+s")` | 菜单项优先，否则真键盘 |
+| `await app.set(ref, "v")` | 直接写值 |
+| `await app.shot("/tmp/a.png")` | 截图 |
+| `scu.sleep(ms)` / `scu.log(...)` | 等待 / 输出 |
+
+## 也可以用 batch（JSONL）
+
+
 
 一条命令起一个进程，每条有 ~60ms 启动地板。要连点几十下（比如拖滑块、连发消息），
 把动作写成 JSONL 一次性喂进去：

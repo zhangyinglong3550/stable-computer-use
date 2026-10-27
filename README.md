@@ -126,12 +126,17 @@ Chrome  逐属性  44.0ms → 批量 16.7ms   (2.63x)
 | `scu batch` 每次动作 | — | **0.7 ms** |
 
 ```bash
-# 连做很多动作：一个进程，约 0.7ms/次
-scu batch <<'EOF'
-{"cmd":"click","app":"Finder","ref":"abc123"}
-{"cmd":"type","app":"Finder","text":"hello"}
-EOF
+# code mode：写一段代码跑完整串动作（推荐）
+scu js -e '
+const app = await scu.getApp("Finder");
+console.log(await app.state());
+await app.click({ref: "abc123"});
+await app.key("super+n");
+'
 ```
+
+实测 20 次「取状态」：code mode **734ms**，逐个 CLI **2526ms**（3.4x）。
+动作类的差距更大——缓存命中 0.16ms vs 每步 111ms。
 
 一句话：**动作是微秒级的，快照是百毫秒级的，进程启动是几十毫秒级的。**
 能连续做的事就用 batch，别一条一条起进程。
@@ -260,6 +265,7 @@ scu recipe save NAME < steps.json
 scu recipe run  NAME --app Finder
 scu recipe list
 
+scu js -e '...'                           # code mode：一段代码跑完整串动作（最快）
 scu bench --app Finder --runs 20
 ```
 

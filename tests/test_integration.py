@@ -300,6 +300,49 @@ class TestDoctorAlwaysRuns(unittest.TestCase):
             self.assertIn("reasonCode", d)
 
 
+@unittest.skipUnless(AVAILABLE, "AX 不可用")
+class TestCodeMode(unittest.TestCase):
+    """code mode：一段代码跑完整串动作，这是最快的用法。"""
+
+    def setUp(self):
+        if not APP:
+            self.skipTest("没有带窗口的 app 可用")
+
+    def _js(self, code: str) -> tuple[str, str, int]:
+        proc = subprocess.run(
+            [sys.executable, str(SCU), "js", "-e", code],
+            capture_output=True, text=True, timeout=90)
+        return proc.stdout, proc.stderr, proc.returncode
+
+    def test_state_returns_text(self):
+        out, err, code = self._js(
+            f'const a = await scu.getApp("{APP}"); console.log(await a.state());')
+        self.assertEqual(code, 0, err)
+        self.assertIn("[", out, "state() 应该返回带 ref 的文本树")
+
+    def test_multiple_reads_in_one_process(self):
+        out, err, code = self._js(
+            f'const a = await scu.getApp("{APP}");\n'
+            'for (let i=0;i<5;i++) await a.state();\n'
+            'console.log("rpc=" + scu.rpcCount);')
+        self.assertEqual(code, 0, err)
+        # 1 次 getApp + 5 次 state
+        self.assertIn("rpc=6", out)
+
+    def test_unknown_app_raises(self):
+        out, err, code = self._js(
+            'await scu.getApp("definitely.not.installed.app")')
+        self.assertNotEqual(code, 0)
+        self.assertIn("找不到 app", err)
+
+    def test_js_error_does_not_kill_daemon(self):
+        """脚本报错很正常；daemon 必须活着，下一个请求照常工作。"""
+        self._js('throw new Error("boom")')
+        out, err, code = self._js('console.log(JSON.stringify(await scu.ping()))')
+        self.assertEqual(code, 0, err)
+        self.assertIn('"ok":true', out.replace(" ", ""))
+
+
 if __name__ == "__main__":
     print(f"AX available: {AVAILABLE} | app: {APP}\n", file=sys.stderr)
     unittest.main(verbosity=2)

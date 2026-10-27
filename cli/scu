@@ -955,6 +955,34 @@ def _image_scale(path: str, point_w: int, point_h: int) -> float:
     return 1.0
 
 
+def cmd_js(args) -> int:
+    """code mode：写一段 JS 一次跑完一整串动作。
+
+    一步一条命令要付一次进程启动（Python 75ms / Node 20ms）；
+    一条代码里每个动作只要 ~0.7ms。这是 Codex 用 code_mode 的全部理由。
+    """
+    from shutil import which
+
+    node = which("node")
+    if not node:
+        die("node_missing", "需要 Node.js 才能用 code mode（brew install node）", 2)
+    runtime = Path(__file__).resolve().parent / "jsapi.mjs"
+    if not runtime.is_file():
+        die("runtime_missing", f"缺少 {runtime}", 2)
+
+    ensure_daemon()                      # 先把 daemon 拉起来，脚本里就只剩动作
+    if args.code:
+        argv = [node, str(runtime), "-e", args.code]
+    elif args.file:
+        argv = [node, str(runtime), args.file]
+    else:
+        die("bad_args", "js 需要 <file> 或 -e '<code>'", 4)
+
+    proc = subprocess.run(argv, env={**os.environ, "SCU_SOCK": SOCK_PATH},
+                          timeout=args.timeout)
+    return proc.returncode
+
+
 def cmd_batch(args) -> int:
     """从 stdin 读 JSONL 命令，逐条执行并输出 JSONL。
 
@@ -1116,6 +1144,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--app")
     r.add_argument("--goal", default="")
     r.set_defaults(fn=cmd_recipe)
+
+    js = sub.add_parser("js", help="code mode：写一段 JS 跑完整串动作（最快）")
+    js.add_argument("file", nargs="?")
+    js.add_argument("-e", "--code")
+    js.add_argument("--timeout", type=float, default=120.0)
+    js.set_defaults(fn=cmd_js)
 
     bt = sub.add_parser("batch", help="从 stdin 读 JSONL 命令，一个进程跑完")
     bt.add_argument("--stop-on-error", action="store_true")

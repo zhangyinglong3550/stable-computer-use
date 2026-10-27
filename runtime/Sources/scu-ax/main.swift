@@ -342,7 +342,7 @@ func resolveAppSafe(_ spec: String) -> AppRef? {
     return AppRef(app: app, ax: ax)
 }
 
-func targetWindow(_ a: AppRef) -> AXUIElement {
+func targetWindow(_ a: AppRef) -> AXUIElement? {
     if let w = attr(a.ax, kAXFocusedWindowAttribute) {
         let el = w as! AXUIElement
         if isWindow(el) { return el }
@@ -354,14 +354,7 @@ func targetWindow(_ a: AppRef) -> AXUIElement {
     if let ws = attr(a.ax, kAXWindowsAttribute) as? [AXUIElement] {
         if let f = ws.first(where: { isWindow($0) }) { return f }
     }
-    let name = a.app.localizedName ?? "?"
-    // 区分"真的没窗口"和"AX 根本读不到"：对 app 自己读一次角色
-    var probe: CFTypeRef?
-    let probeErr = AXUIElementCopyAttributeValue(a.ax, kAXRoleAttribute as CFString, &probe)
-    if probeErr == .cannotComplete {
-        die("ax_cannot_complete: AX 返回 -25204，可能是屏幕锁定、显示器休眠或 AX 服务无响应", code: 10)
-    }
-    die("no_window: \(name) 没有可操作的窗口（可能只有桌面，或被最小化）", code: 3)
+    return nil
 }
 
 struct Snapshot {
@@ -384,9 +377,8 @@ func windowRect(_ w: AXUIElement) -> CGRect? {
 }
 
 func snapshot(_ spec: String, maxN: Int = 4000, maxDepth: Int = 20,
-              visibleOnly: Bool = true) -> Snapshot {
-    let a = resolveApp(spec)
-    let w = targetWindow(a)
+              visibleOnly: Bool = true) -> Snapshot? {
+    guard let a = resolveAppSafe(spec), let w = targetWindow(a) else { return nil }
     // 窗口矩形 ∩ 它所在屏幕的可用区域 = 真正看得见的部分
     var visible: CGRect? = nil
     if visibleOnly, let wr = windowRect(w) {
@@ -458,7 +450,8 @@ func toJSON(_ s: Snapshot) -> [String: Any] {
         for c in n.children where s.keep[c] { walk(c) }
     }
     if s.keep.indices.contains(0) && s.keep[0] { walk(0) }
-    var payload: [String: Any] = ["app": s.app.app.localizedName ?? "",
+    var payload: [String: Any] = ["ok": true,
+                                  "app": s.app.app.localizedName ?? "",
                                   "bundle": s.app.app.bundleIdentifier ?? "",
                                   "window": s.title, "elements": out]
     if s.truncated { payload["truncated"] = true }
@@ -892,7 +885,9 @@ func handleClient(_ fd: Int32) {
                            "running": NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }.sorted().prefix(40).map { $0 }])
             return
         }
-        let snap = snapshot(appSpec, maxN: maxN)
+        guard let snap = snapshot(appSpec, maxN: maxN) else {
+            writeLine(fd, ["ok": false, "reasonCode": "no_window", "app": appSpec]); return
+        }
         cacheStore(snap)
         var out = toJSON(snap)
         out["cached"] = cache.count
@@ -903,7 +898,9 @@ func handleClient(_ fd: Int32) {
             var r = cachedPress(ref)
             if r["ok"] as? Bool != true {
                 // 缓存失效 → 重取一次再试
-                let snap = snapshot(appSpec)
+                guard let snap = snapshot(appSpec) else {
+                    writeLine(fd, ["ok": false, "reasonCode": "no_window", "app": appSpec]); return
+                }
                 cacheStore(snap)
                 r = cachedPress(ref)
             }
@@ -1104,7 +1101,11 @@ case "apps":
 
 case "snapshot":
     guard let appSpec = args.flag("app") else { die("missing --app", code: 4) }
-    let s = snapshot(appSpec, maxN: args.int("max", 4000))
+    guard let s = snapshot(appSpec, maxN: args.int("max", 4000)) else {
+        let app = resolveAppSafe(appSpec)
+        let name = app?.app.localizedName ?? appSpec
+        die("no_window: \(name) 没有可操作的窗口（可能只有桌面、被最小化，或显示器休眠）", code: 3)
+    }
     if args.has("json") {
         emit(toJSON(s))
     } else {
@@ -1162,7 +1163,9 @@ case "act":
         }
 
         // 元素点击
-        let s = snapshot(appSpec)
+        guard let s = snapshot(appSpec) else {
+        die("no_window: \(appSpec) 没有可操作的窗口", code: 3)
+    }
         var target = -1
         if let ref = args.flag("ref") {
             guard let i = findNode(s, ref: ref) else {
@@ -1222,7 +1225,9 @@ case "act":
 
     // ---------- set ----------
     if op == "set" {
-        let s = snapshot(appSpec)
+        guard let s = snapshot(appSpec) else {
+        die("no_window: \(appSpec) 没有可操作的窗口", code: 3)
+    }
         guard let ref = args.flag("ref"), let i = findNode(s, ref: ref) else {
             emit(["ok": false, "reasonCode": "stale_ref"]); exit(5)
         }
@@ -1241,7 +1246,9 @@ case "act":
         // 目标：指定 ref 的元素，或该 app 当前的焦点元素。都不需要 app 在前台。
         var targetEl: AXUIElement?
         if let ref = args.flag("ref") {
-            let s = snapshot(appSpec)
+            guard let s = snapshot(appSpec) else {
+        die("no_window: \(appSpec) 没有可操作的窗口", code: 3)
+    }
             if let i = findNode(s, ref: ref) { targetEl = s.elems[i] }
         } else {
             var f: CFTypeRef?
@@ -1290,7 +1297,9 @@ case "act":
 
     // ---------- scroll ----------
     if op == "scroll" {
-        let s = snapshot(appSpec)
+        guard let s = snapshot(appSpec) else {
+        die("no_window: \(appSpec) 没有可操作的窗口", code: 3)
+    }
         guard let ref = args.flag("ref"), let i = findNode(s, ref: ref) else {
             emit(["ok": false, "reasonCode": "stale_ref"]); exit(5)
         }
@@ -1341,7 +1350,9 @@ case "verify":
     guard let appSpec = args.flag("app"), let ref = args.flag("ref") else {
         die("missing --app/--ref", code: 4)
     }
-    let s = snapshot(appSpec)
+    guard let s = snapshot(appSpec) else {
+        die("no_window: \(appSpec) 没有可操作的窗口", code: 3)
+    }
     guard let i = findNode(s, ref: ref) else {
         emit(["ok": false, "reasonCode": "stale_ref", "ref": ref]); exit(5)
     }
