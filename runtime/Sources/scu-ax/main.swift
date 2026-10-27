@@ -190,13 +190,14 @@ struct Identity: Hashable {
     let rect: String
 }
 
-func collect(_ root: AXUIElement, maxN: Int, maxDepth: Int)
+func collect(_ root: AXUIElement, maxN: Int, maxDepth: Int, visibleRect: CGRect? = nil)
     -> (nodes: [Node], elems: [AXUIElement], truncated: Bool, cycles: Int) {
 
     var nodes: [Node] = []
     var elems: [AXUIElement] = []
     var cycles = 0
     var truncated = false
+    var skipped = 0
 
     func ident(_ info: (role: String, subrole: String?, label: String?, value: String?,
                         rect: CGRect?, children: [AXUIElement], enabled: Bool)) -> Identity {
@@ -218,6 +219,11 @@ func collect(_ root: AXUIElement, maxN: Int, maxDepth: Int)
             return
         }
 
+        // 可见区过滤：滚出屏幕的行（虚拟列表里常有上千个）没必要读
+        if let vr = visibleRect, let r = info.rect, !vr.intersects(r) {
+            skipped += 1
+            return
+        }
         let acts = actionsFor(el, role: info.role)
         let me = nodes.count
         nodes.append(Node(role: info.role, subrole: info.subrole, label: info.label, value: info.value,
@@ -233,6 +239,7 @@ func collect(_ root: AXUIElement, maxN: Int, maxDepth: Int)
         }
     }
     walk(root, 0, -1, [])
+    if skipped > 0 { FileHandle.standardError.write(Data("skipped-offscreen: \(skipped)\n".utf8)) }
     return (nodes, elems, truncated, cycles)
 }
 
@@ -355,10 +362,27 @@ struct Snapshot {
     var cycles: Int = 0
 }
 
-func snapshot(_ spec: String, maxN: Int = 4000, maxDepth: Int = 20) -> Snapshot {
+func windowRect(_ w: AXUIElement) -> CGRect? {
+    var p = CGPoint.zero, sz = CGSize.zero
+    if let pv = attr(w, kAXPositionAttribute) { AXValueGetValue(pv as! AXValue, .cgPoint, &p) }
+    if let sv = attr(w, kAXSizeAttribute) { AXValueGetValue(sv as! AXValue, .cgSize, &sz) }
+    guard sz.width > 0, sz.height > 0 else { return nil }
+    return CGRect(origin: p, size: sz)
+}
+
+func snapshot(_ spec: String, maxN: Int = 4000, maxDepth: Int = 20,
+              visibleOnly: Bool = true) -> Snapshot {
     let a = resolveApp(spec)
     let w = targetWindow(a)
-    let (nodes, elems, truncated, cycles) = collect(w, maxN: maxN, maxDepth: maxDepth)
+    // 窗口矩形 ∩ 它所在屏幕的可用区域 = 真正看得见的部分
+    var visible: CGRect? = nil
+    if visibleOnly, let wr = windowRect(w) {
+        for scr in NSScreen.screens where scr.frame.intersects(wr) {
+            visible = wr.intersection(scr.visibleFrame)
+            break
+        }
+    }
+    let (nodes, elems, truncated, cycles) = collect(w, maxN: maxN, maxDepth: maxDepth, visibleRect: visible)
     let keep = prune(nodes)
     var out = nodes
     let sigs = assignSignatures(nodes, keep: keep)
@@ -727,6 +751,7 @@ func writeText(into el: AXUIElement, _ text: String) -> Bool {
 
 var cache: [String: AXUIElement] = [:]      // ref -> 活元素
 var cacheMeta: [String: [String: Any]] = [:] // ref -> 元信息
+var cacheOwner: [String: String] = [:]       // ref -> 最近的可点祖先 ref
 var cacheApp = ""
 var cacheWindow = ""
 
@@ -735,9 +760,13 @@ func cacheStore(_ snap: Snapshot) {
     cacheMeta.removeAll(keepingCapacity: true)
     cacheApp = snap.app.app.bundleIdentifier ?? ""
     cacheWindow = snap.title
+    cacheOwner.removeAll(keepingCapacity: true)
     for i in snap.nodes.indices where snap.keep[i] {
         let ref = snap.nodes[i].ref
         cache[ref] = snap.elems[i]
+        // 文字节点自己点不动 —— 记住它归属的可点祖先，动作时直接跳过去
+        let anc = actionableAncestor(snap.nodes, i, keep: snap.keep)
+        if anc != i { cacheOwner[ref] = snap.nodes[anc].ref }
         var m: [String: Any] = ["role": snap.nodes[i].role, "enabled": snap.nodes[i].enabled]
         if let l = snap.nodes[i].label { m["label"] = l }
         if let v = snap.nodes[i].value { m["value"] = v }
@@ -748,18 +777,26 @@ func cacheStore(_ snap: Snapshot) {
 
 /// 在缓存元素上直接执行"按压类"动作。不重走树。
 func cachedPress(_ ref: String) -> [String: Any] {
-    guard let el = cache[ref] else {
-        return ["ok": false, "reasonCode": "cache_miss", "ref": ref]
-    }
-    var acts: CFArray?
-    AXUIElementCopyActionNames(el, &acts)
-    let list = (acts as? [String]) ?? []
-    for want in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where list.contains(want) {
-        if AXUIElementPerformAction(el, want as CFString) == .success {
-            return ["ok": true, "op": "click", "ref": ref, "action": want, "via": "daemon-cache"]
+    // 先试自己，再试归属的可点祖先 —— 都从缓存拿，不重走树
+    var chain = [ref]
+    if let owner = cacheOwner[ref], owner != ref { chain.append(owner) }
+
+    for candidate in chain {
+        guard let el = cache[candidate] else { continue }
+        var acts: CFArray?
+        AXUIElementCopyActionNames(el, &acts)
+        let list = (acts as? [String]) ?? []
+        for want in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where list.contains(want) {
+            if AXUIElementPerformAction(el, want as CFString) == .success {
+                var r: [String: Any] = ["ok": true, "op": "click", "ref": ref,
+                                        "action": want, "via": "daemon-cache"]
+                if candidate != ref { r["pressedAncestor"] = candidate }
+                return r
+            }
         }
     }
-    return ["ok": false, "reasonCode": "no_ax_action", "ref": ref, "actions": list]
+    if cache[ref] == nil { return ["ok": false, "reasonCode": "cache_miss", "ref": ref] }
+    return ["ok": false, "reasonCode": "no_ax_action", "ref": ref]
 }
 
 func writeLine(_ fd: Int32, _ obj: [String: Any]) {
