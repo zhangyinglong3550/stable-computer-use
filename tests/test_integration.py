@@ -370,6 +370,30 @@ class TestCodeMode(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn('"ok":true', out.replace(" ", ""))
 
+    def test_act_expect_window(self):
+        """act 的 expect 能等到当前窗口，且只读、无副作用。"""
+        d, _ = run("snapshot", "--app", APP, "--json")
+        title = d.get("window") or ""
+        if not title:
+            self.skipTest("窗口没有标题")
+        out, err, code = self._js(
+            f'const a = await scu.getApp("{APP}");\n'
+            f'const r = await a.act([{{op:"expect",window:{json.dumps(title)},timeoutMs:1500}}]);\n'
+            'console.log(JSON.stringify({ok:r.ok,failedAt:r.failedAt,steps:r.steps.length}));')
+        self.assertEqual(code, 0, err)
+        self.assertIn('"ok":true', out.replace(" ", ""))
+
+    def test_act_stops_on_first_error(self):
+        """失败即停：第二步不该被执行。"""
+        out, err, code = self._js(
+            f'const a = await scu.getApp("{APP}");\n'
+            'const r = await a.act([{op:"click",ref:"zzzzzz"},{op:"sleep",ms:10}]);\n'
+            'console.log(JSON.stringify({ok:r.ok,failedAt:r.failedAt,steps:r.steps.length}));')
+        self.assertEqual(code, 0, err)
+        compact = out.replace(" ", "")
+        self.assertIn('"failedAt":0', compact)
+        self.assertIn('"steps":1', compact)
+
 
 @unittest.skipUnless(AVAILABLE, "AX 不可用")
 class TestChangeDetection(unittest.TestCase):

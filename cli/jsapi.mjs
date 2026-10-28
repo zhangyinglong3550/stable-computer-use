@@ -161,6 +161,153 @@ class App {
     return r;
   }
 
+  /**
+   * 一次调用跑完一串动作，失败即停，返回紧凑报告。
+   *
+   * 这是"少回合"的核心：一步一条命令要 N 次模型往返，这里只要 1 次。
+   * 每个动作默认带 wait（actAndWait），所以结果里直接有 changed / verification，
+   * 不需要再单独发一条 snapshot 去确认。
+   *
+   *   await app.act([
+   *     { op: "click", text: "文件传输助手" },   // 也可以 ref / x+y
+   *     { op: "expect", text: "文件传输助手" },   // 等界面出现这段文字
+   *     { op: "set", ref: "abc", value: "你好", requireVerified: true },
+   *     { op: "key", key: "Return" },
+   *     { op: "expect", text: "你好", timeoutMs: 2000 },
+   *   ]);
+   */
+  async act(steps, opts = {}) {
+    if (!Array.isArray(steps)) throw new Error("act 需要步骤数组");
+    const stopOnError = opts.stopOnError !== false;
+    const waitMs = opts.waitTimeoutMs ?? 800;
+    const started = Date.now();
+    const results = [];
+    let failedAt = null;
+
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i] ?? {};
+      const t0 = Date.now();
+      let r;
+      try {
+        r = await this._step(step, waitMs);
+      } catch (e) {
+        r = { ok: false, reasonCode: "js_error", message: e?.message || String(e) };
+      }
+      results.push({ index: i, op: step.op, ms: Date.now() - t0, ...r });
+      if (stopOnError && r.ok === false) {
+        failedAt = i;
+        break;
+      }
+    }
+
+    return { ok: failedAt === null, failedAt, elapsedMs: Date.now() - started, steps: results };
+  }
+
+  async _step(step, waitMs) {
+    switch (step.op) {
+      case "click": {
+        let target;
+        if (step.ref) {
+          target = { ref: step.ref };
+        } else if (step.text) {
+          target = await this._findTarget(step.text);
+          if (!target) return { ok: false, reasonCode: "text_not_found", text: step.text };
+        } else {
+          target = { x: step.x, y: step.y };
+        }
+        return rpc({
+          cmd: "actAndWait", app: this.name, ...target,
+          space: step.space, via: step.via, mouse: step.via === "mouse",
+          button: step.button, count: step.count,
+          timeoutMs: step.waitTimeoutMs ?? waitMs,
+        });
+      }
+      case "type":
+        return rpc({
+          cmd: "actAndWait", app: this.name, text: step.text, ref: step.ref,
+          timeoutMs: step.waitTimeoutMs ?? waitMs,
+        });
+      case "key":
+        return rpc({
+          cmd: "actAndWait", app: this.name, key: step.key,
+          activate: step.activate === true,
+          timeoutMs: step.waitTimeoutMs ?? waitMs,
+        });
+      case "set": {
+        const r = await rpc({ cmd: "set", app: this.name, ref: step.ref, value: step.value });
+        if (step.requireVerified && r.verification?.state !== "verified") {
+          return { ...r, ok: false, reasonCode: "value_not_verified" };
+        }
+        return r;
+      }
+      case "scroll":
+        return rpc({
+          cmd: "scroll", app: this.name, ref: step.ref,
+          direction: step.direction ?? "down", pages: step.pages ?? 1,
+        });
+      case "expect": {
+        const timeout = step.timeoutMs ?? 3000;
+        const hit = step.window
+          ? await this.waitFor((_, snap) => (snap.window || "").includes(step.window), { timeoutMs: timeout })
+          : await this._waitForText(step.text, timeout, step.absent === true);
+        const what = step.window ? `window=${step.window}` : `text=${step.text}`;
+        return hit
+          ? { ok: true, verification: { state: "verified", source: "expect " + what } }
+          : { ok: false, reasonCode: "expect_timeout", expect: what };
+      }
+      case "sleep":
+        await new Promise((r) => setTimeout(r, step.ms ?? 100));
+        return { ok: true };
+      default:
+        return { ok: false, reasonCode: "unknown_op", op: step.op };
+    }
+  }
+
+  /**
+   * 按文字找一个可操作的落点。
+   * 有动作就直接点 ref；纯文字节点（Finder 侧栏那种）就用它 rect 的中心做坐标命中，
+   * 让 daemon 往上找可点祖先 —— 和 CLI 的 click --text 行为一致。
+   */
+  async _findTarget(text) {
+    const snap = await rpc({ cmd: "snapshot", app: this.name, max: 4000, actions: true });
+    if (snap.ok === false) return null;
+    const hit = (snap.elements || []).find((e) =>
+      `${e.label || ""} ${e.value || ""}`.includes(text));
+    if (!hit) return null;
+    if (hit.actions?.length) return { ref: hit.target_ref || hit.ref };
+    if (hit.rect && hit.rect.w > 0 && hit.rect.h > 0) {
+      return { x: hit.rect.x + hit.rect.w / 2, y: hit.rect.y + hit.rect.h / 2 };
+    }
+    return { ref: hit.target_ref || hit.ref };
+  }
+
+  /** 等界面出现/消失某段文字。用轮询替代 sleep(2000)。 */
+  async _waitForText(text, timeoutMs, absent) {
+    if (!text) return false;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const snap = await rpc({ cmd: "snapshot", app: this.name, max: 4000, actions: false });
+      if (snap.ok !== false) {
+        const hit = (snap.elements || []).some((e) =>
+          `${e.label || ""} ${e.value || ""}`.includes(text));
+        if (hit !== absent) return true;
+      }
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    return false;
+  }
+
+  /** 等某个条件成立：fn(elements) -> boolean */
+  async waitFor(fn, opts = {}) {
+    const deadline = Date.now() + (opts.timeoutMs ?? 3000);
+    while (Date.now() < deadline) {
+      const snap = await rpc({ cmd: "snapshot", app: this.name, max: 4000, actions: false });
+      if (snap.ok !== false && fn(snap.elements || [], snap)) return true;
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    return false;
+  }
+
   /** 截图。走 CLI 的 screencapture 路径，返回文件路径。 */
   async shot(out) {
     const { spawnSync } = await import("node:child_process");

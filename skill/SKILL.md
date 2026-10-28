@@ -40,42 +40,70 @@ scu doctor
 
 `accessibilityUsable` 必须是 `true`。只是 `accessibility: true` 不够。
 
-## 默认写法：一段代码跑完
+## 默认写法：一次调用跑完整串
 
-**不要一步一条命令。** 一条命令付一次进程启动（约 75ms），动作本身只要 0.16ms。
+一步一条命令 = 一次进程启动 + 一次模型往返。连续动作必须写成一段 `scu js`，
+再用 `app.act([...])` 包起来：失败即停、每步自带确认、返回紧凑报告。
+
+```bash
+scu js -e '
+const app = await scu.getApp("Sublime Text");
+const r = await app.act([
+  { op: "key", key: "super+n" },
+  { op: "type", text: "空山新雨后，天气晚来秋。" },
+  { op: "key", key: "Return" },
+  { op: "type", text: "明月松间照，清泉石上流。" },
+]);
+console.log(JSON.stringify({ ok: r.ok, failedAt: r.failedAt, ms: r.elapsedMs }));
+'
+```
+
+实测：4 步（2 次点击 + 2 次 `expect`）**406ms**；10 次快照 660ms（含 Node 启动）。
+
+### act 的步骤
+
+| op | 参数 | 说明 |
+|---|---|---|
+| `click` | `ref` / `text` / `x,y` | `text` 先解析元素；纯文字节点自动退化成坐标命中 |
+| `type` | `text`, `ref?` | AX 直写，失败转定向投递 |
+| `key` | `key`, `activate?` | 菜单项优先，否则定向投递 |
+| `set` | `ref`, `value`, `requireVerified?` | 整体赋值 + 读回 |
+| `scroll` | `ref`, `direction`, `pages` | AX 滚动，否则定向滚轮 |
+| `expect` | `text` 或 `window`, `timeoutMs` | 轮询到出现，**替代 sleep** |
+| `sleep` | `ms` | 只有确实没有可观测信号时才用 |
+
+返回 `{ok, failedAt, elapsedMs, steps:[{op, ok, ms, changed, verification}]}`。
+`stopOnError: false` 可以不中断地跑完。
+
+### 发消息：发送前必须确认会话
 
 ```bash
 scu js -e '
 const app = await scu.getApp("com.tencent.WeWorkMac");
-const st = await app.state({json: true});          // 拿结构
-const row = st.elements.find(e => (e.label||"").includes("文件传输助手") && e.rect);
-await app.click({ x: row.rect.x + row.rect.w/2, y: row.rect.y + row.rect.h/2, mouse: true });
-await scu.sleep(400);
-await app.type("你好");
-await app.key("Return");
+const r = await app.act([
+  { op: "click", text: "文件传输助手" },
+  { op: "expect", window: "文件传输助手", timeoutMs: 3000 },   // 先确认点对了人
+  { op: "set", ref: "<输入框 ref>", value: "你好", requireVerified: true },
+  { op: "key", key: "Return" },
+  { op: "expect", text: "你好", timeoutMs: 3000 },             // 再确认发出去了
+]);
+if (!r.ok) throw new Error("第 " + r.failedAt + " 步失败");
 '
 ```
 
-## 默认用 code mode，别一步一条命令
+点错会话的代价是发给别人，**不能只靠 `verification` 兜底**：发送前一定要 `expect` 会话标题。
 
-一步一条命令，每条都要付一次进程启动（75ms）。**连续动作必须写成一段代码**，一次跑完：
+### 单条 CLI 只用于探索
 
-```bash
-scu js -e '
-const app = await scu.getApp("com.apple.finder");
-console.log(await app.state());        // 先看一眼
-await app.click({ref: "abc123"});      // AX 动作，不动鼠标
-await app.key("super+n");
-console.log(await app.state());        // 再看一眼
-'
-```
-
-每个动作 **0.16–0.7ms**，比逐个调用快两个数量级。
+`scu snapshot` / `scu click` 一条条发，只在第一次摸不清界面时用。
+探明路径后立刻写成 `act` 脚本，否则每一步都要付一次模型往返。
 
 ### API
 
 | 写法 | 作用 |
 |---|---|
+| **`await app.act([...])`** | **一次跑完整串，失败即停，返回报告（首选）** |
+| `await app.waitFor(fn)` | 等条件成立，替代 sleep |
 | `await scu.getApp("Finder")` | 绑定 app（名字或 bundle id） |
 | `await app.state()` | 紧凑文本树，直接打印 |
 | `await app.click({ref})` | AX 动作，不动鼠标不抢焦点 |

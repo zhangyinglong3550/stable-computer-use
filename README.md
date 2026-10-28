@@ -120,6 +120,26 @@ verified · via ax
 为什么它不单独做成 app：见 `docs/design.md` 第 9 节 —— Codex 的执行器是独立 `.app`，
 但屏幕上那条浮窗反而是主 app 的 Electron 窗口。
 
+## 一次调用跑完整串
+
+`scu js` + `app.act([...])`：失败即停、每步自带确认，模型只看一份报告。
+
+```js
+const r = await app.act([
+  { op: "click", text: "文件传输助手" },
+  { op: "expect", window: "文件传输助手" },     // 先确认点对了人
+  { op: "set", ref: "<输入框>", value: "你好", requireVerified: true },
+  { op: "key", key: "Return" },
+  { op: "expect", text: "你好" },               // 再确认发出去了
+]);
+if (!r.ok) throw new Error(`第 ${r.failedAt} 步失败`);
+```
+
+实测：4 步（2 次点击 + 2 次 `expect`）**406ms**；`scu js` 里连跑 10 次快照 660ms（含 Node 启动）。
+
+省的不是本地执行——两边都是百毫秒级——而是**每个动作一次模型往返 + 一次观察**。
+`expect` 替代 `sleep`，`changed`/`verification` 直接进报告，不用再单独截图确认。
+
 ## 为什么是它：三个可验证的点
 
 ### 1. 快照快到不值得优化
@@ -439,7 +459,7 @@ docs/design.md               设计取舍与实测数据
 | 层 | 文件 | 需要权限 | 说明 |
 |---|---|---|---|
 | 单元 | `tests/test_unit.py` | ❌ | 31 条，覆盖文本清洗、打分器（含"预筛绝不返空"回归）、置信度、记忆、exit code、坐标空间参数契约 |
-| 集成 | `tests/test_integration.py` | ✅ | 27 条，真读 AX：ref 唯一性与跨快照稳定性、坐标契约（`windowRect`/`coordinateSpace`）、零宽字符清洗、target_ref 可解析、verify、pid 投递契约、decide 各层、记忆闭环、截图换算公式 |
+| 集成 | `tests/test_integration.py` | ✅ | 29 条，真读 AX：ref 唯一性与跨快照稳定性、坐标契约（`windowRect`/`coordinateSpace`）、零宽字符清洗、target_ref 可解析、verify、pid 投递契约、`act` 批量与失败即停、decide 各层、记忆闭环、截图换算公式 |
 
 集成测试在 AX 不可用（没授权 / 锁屏 / 显示器休眠）时**整体跳过而不是失败**，所以 CI 里也不会红。
 
