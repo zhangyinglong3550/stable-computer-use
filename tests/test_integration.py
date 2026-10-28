@@ -87,6 +87,21 @@ class TestSnapshot(unittest.TestCase):
         refs = [e["ref"] for e in d["elements"]]
         self.assertEqual(len(refs), len(set(refs)), "同一快照内 ref 必须唯一")
 
+    def test_coordinate_contract(self):
+        """坐标只有一种话：snapshot 的矩形是屏幕坐标，且必须显式声明。"""
+        d, _ = run("snapshot", "--app", APP, "--json")
+        self.assertEqual(d.get("coordinateSpace"), "screen")
+        self.assertIn("windowRect", d, "窗口矩形是动作坐标的基准，不能缺")
+        self.assertIn("windowOrigin", d)
+        wr = d["windowRect"]
+        self.assertEqual(wr["x"], d["windowOrigin"]["x"])
+        for e in d["elements"]:
+            r = e.get("rect")
+            if r:
+                # 元素的坐标必须在屏幕空间里，能直接喂给 --xy
+                self.assertIsInstance(r["x"], (int, float))
+                self.assertIsInstance(r["y"], (int, float))
+
     def test_refs_stable_across_snapshots(self):
         a, _ = run("snapshot", "--app", APP, "--json")
         b, _ = run("snapshot", "--app", APP, "--json")
@@ -257,8 +272,17 @@ class TestNonIntrusive(unittest.TestCase):
         self.assertEqual(code, 11)
         self.assertEqual(d["reasonCode"], "needs_takeover")
 
-    def test_key_without_menu_item_requires_takeover(self):
+    def test_key_without_menu_item_uses_pid_route(self):
+        """不是菜单项的组合键：默认定向投递（不抢焦点），且如实标 unverified。"""
         d, code = run("key", "--app", APP, "--key", "super+alt+shift+z")
+        self.assertEqual(code, 0, d)
+        self.assertEqual(d.get("via"), "pid")
+        self.assertEqual(d["verification"]["state"], "unverified")
+        self.assertEqual(d["verification"]["reason"], "synthetic_input")
+
+    def test_key_global_route_still_requires_takeover(self):
+        """要真键盘（系统事件流）时，仍然必须显式接管。"""
+        d, code = run("key", "--app", APP, "--key", "super+alt+shift+z", "--via", "mouse")
         self.assertEqual(code, 11)
         self.assertEqual(d["reasonCode"], "needs_takeover")
 
@@ -286,6 +310,10 @@ class TestShot(unittest.TestCase):
             self.assertEqual(code, 0, d)
             self.assertTrue(out.is_file())
             self.assertGreater(out.stat().st_size, 1000)
+            # 图像像素 → 动作坐标的换算必须由工具给出，别让调用方猜
+            self.assertIn("scale", d)
+            self.assertIn("actionFormula", d)
+            self.assertEqual(d.get("coordinateSpace"), "screen")
 
 
 class TestDoctorAlwaysRuns(unittest.TestCase):
@@ -365,14 +393,13 @@ class TestChangeDetection(unittest.TestCase):
     def test_wait_reports_fields(self):
         p = self._js(
             f'const a = await scu.getApp("{APP}");\n'
-            'const s = await a.state({json:true});\n'
-            'const t = s.elements.find(e => e.actions && e.actions.includes("AXPress"));\n'
-            'if (!t) { console.log("SKIP"); } else {\n'
-            '  const r = await a.clickAndWait({ref: t.ref}, {timeoutMs: 400});\n'
-            '  console.log(JSON.stringify({changed: r.changed, hasWaited: typeof r.waitedMs === "number"}));\n'
-            '}')
+            'const r = await a.keyAndWait("Escape", {timeoutMs: 300});\n'
+            'console.log(JSON.stringify({changed: r.changed,'
+            ' hasWaited: typeof r.waitedMs === "number",'
+            ' hasVerification: !!r.verification, via: r.via}));')
         self.assertIn("changed", p.stdout, p.stderr)
         self.assertIn("hasWaited", p.stdout)
+        self.assertIn("hasVerification", p.stdout)
 
 
 if __name__ == "__main__":

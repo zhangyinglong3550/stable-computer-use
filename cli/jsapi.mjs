@@ -94,27 +94,32 @@ class App {
     if (!target || (!target.ref && (target.x == null || target.y == null))) {
       throw new Error("click 需要 {ref} 或 {x,y}");
     }
+    // via: "ax"(默认) | "pid"(定向投递，不动光标) | "mouse"(系统鼠标，会动光标)
+    // space: "screen"(默认) | "window"
     const req = { cmd: "click", app: this.name, ...target };
+    if (target.space && !req.space) req.space = target.space;
     const r = await rpc(req);
     if (!r.ok) throw new Error(`click failed: ${r.reasonCode} ${r.hint || ""}`.trim());
     return r;
   }
 
-  async type(text) {
-    const r = await rpc({ cmd: "type", app: this.name, text });
+  async type(text, opts = {}) {
+    const r = await rpc({ cmd: "type", app: this.name, text, ...opts });
     if (!r.ok) throw new Error(`type failed: ${r.reasonCode} ${r.hint || ""}`.trim());
     return r;
   }
 
-  async key(chord) {
-    const r = await rpc({ cmd: "key", app: this.name, key: chord });
+  async key(chord, opts = {}) {
+    // 默认定向投递（不抢焦点）。需要真键盘时传 { activate: true }。
+    const r = await rpc({ cmd: "key", app: this.name, key: chord, ...opts });
     if (!r.ok) throw new Error(`key failed: ${r.reasonCode} ${r.hint || ""}`.trim());
     return r;
   }
 
   /**
    * 动作 + 等界面变化，一步到位。
-   * 返回 { ok, changed, waitedMs } —— changed=false 说明动作可能没生效。
+   * 返回 { ok, changed, waitedMs, verification } —— changed=false 说明动作可能没生效，
+   * verification.state === "unverified" 说明没有读回证据，别报成功。
    * 这是替代「动作后截图给模型看」的关键：30-120ms 的遍历 vs 1-3s 的视觉判断。
    */
   async clickAndWait(target, opts = {}) {
@@ -129,6 +134,7 @@ class App {
   async typeAndWait(text, opts = {}) {
     const r = await rpc({
       cmd: "actAndWait", app: this.name, text, timeoutMs: opts.timeoutMs ?? 1200,
+      ...(opts.ref ? { ref: opts.ref } : {}),
     });
     if (r.ok === false) throw new Error(`typeAndWait failed: ${r.reasonCode}`);
     return r;
@@ -137,6 +143,7 @@ class App {
   async keyAndWait(chord, opts = {}) {
     const r = await rpc({
       cmd: "actAndWait", app: this.name, key: chord, timeoutMs: opts.timeoutMs ?? 1500,
+      ...(opts.activate ? { activate: true } : {}),
     });
     if (r.ok === false) throw new Error(`keyAndWait failed: ${r.reasonCode}`);
     return r;

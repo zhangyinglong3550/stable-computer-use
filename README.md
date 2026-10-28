@@ -37,9 +37,10 @@ stable-computer-use 换成另一条路：**读 AX 树，按元素操作**。
 |---|---|---|
 | 点按钮 / 菜单项 | `AXUIElementPerformAction` | ❌ |
 | 按坐标点 | 命中测试 → 找可点祖先 → `AXPress` | ❌ |
+| 按坐标点（`--via pid`） | `CGEventPostToPid` 定向投递 | ❌ |
 | 往输入框写字 | 直接写 `AXSelectedText` / `AXValue` | ❌ |
-| 滚动 | AX 滚动动作 | ❌ |
-| 组合键 ⌘K 等 | 查菜单栏同名菜单项并触发 | ❌（命中时） |
+| 滚动 | AX 滚动动作；没有就走定向滚轮 | ❌ |
+| 组合键 ⌘K 等 | 查菜单栏同名菜单项；没有就定向投递 | ❌ |
 | 读界面 | AX 树 / 按窗口截图 | ❌ |
 
 ### 但要说清楚：**不抢焦点 ≠ 界面上看不见变化**
@@ -85,7 +86,39 @@ SkyComputerUseService 导入的符号里没有 CGEventPost / CGEventPostToPid / 
 只有 AXUIElementPerformAction、AXUIElementSetAttributeValue、AXUIElementCopyElementAtPosition
 ```
 
-唯一绕不开的是真键盘输入：实测 `CGEvent.postToPid` 能把事件投给指定进程且不移动鼠标，但 app 不在前台时**不会响应**。所以组合键要么走菜单栏，要么就得接管。
+唯一绕不开的是真键盘输入：`CGEvent.postToPid` 能把事件定向投给某个进程且不移动鼠标。
+鼠标事件实测有效（Finder 后台窗口收到了定向点击）；键盘事件取决于目标窗口是否 key window，
+app 可能直接丢弃。所以键盘的定向投递结果**永远标 `unverified(synthetic_input)`**，
+真要保证送到就显式 `--via mouse --take-over`。
+
+## 三档投递 + verification
+
+| 档位 | 实现 | 抢焦点 | 结果 |
+|---|---|---|---|
+| `ax`（默认） | AX 动作 / 属性写 | ❌ | `unverified(axpress_unasserted)`；`set`/`type` 会读回，读回一致才是 `verified(value_readback)` |
+| `pid` | `CGEventPostToPid` | ❌ | `unverified(synthetic_input)`，app 可能丢事件 |
+| `mouse` | 系统事件流 | ✅ 需要 `--take-over` | `unverified(synthetic_input)` |
+
+`ok: true` 只代表调用被接受；`verification.state` 才是"有没有证据"。`--wait` 时如果界面确实变了，
+`unverified(axpress_unasserted)` 会升级成 `verified(ui_changed)` —— 但合成输入（`synthetic_input` /
+`clipboard_paste`）不会升级：界面变了不代表那串字落到了你以为的输入框。
+
+## 看得见地操作
+
+daemon 里跑着一条状态条：无边框 NSPanel、鼠标穿透、不抢焦点，屏幕顶部居中。
+
+```
+scu · click
+verified · via ax
+```
+
+- 写动作开始就亮，结束 1.6 秒后淡出；只读的 `snapshot` 不弹，不会一直闪。
+- 圆点颜色：绿 = `verified`，橙 = `unverified`，红 = 失败（显示 `reasonCode`）。
+- `SCU_HUD=0` 关闭（CI / 无 WindowServer）；`SCU_HUD_POS=bottom` 放到屏幕底部。
+- 它只是展示层，不申请任何额外权限；判断成败仍然只认 `verification`。
+
+为什么它不单独做成 app：见 `docs/design.md` 第 9 节 —— Codex 的执行器是独立 `.app`，
+但屏幕上那条浮窗反而是主 app 的 Electron 窗口。
 
 ## 为什么是它：三个可验证的点
 
@@ -95,9 +128,11 @@ SkyComputerUseService 导入的符号里没有 CGEventPost / CGEventPostToPid / 
 
 | app | p50 | p95 |
 |---|---|---|
-| Finder | **92 ms** | 115 ms |
-| Chrome | **41 ms** | 55 ms |
-| 飞书 | **51 ms** | 64 ms |
+| Finder | **120 ms** | 140 ms |
+| Chrome | **100 ms** | 115 ms |
+| 飞书 | **81 ms** | 126 ms |
+
+（2026-10 本机复测，`bench/run.py --latency-only --runs 15`，含进程启动；数字随机器负载浮动，同一台机器空载时会明显更低。）
 
 其中 AX 遍历用**批量属性读**（一次 IPC 拿全部属性，而不是每个属性一次往返），比逐属性读快 **3 倍**：
 
@@ -318,6 +353,23 @@ ref       = base36(fnv1a64(signature))[:6]
 | AX 优先，鼠标兜底 | 控件优先走 `AXPress`（不动鼠标、不抢焦点）；普通元素才合成鼠标事件 |
 | 脏字符清洗 | 真实 app 的标题里塞零宽字符（Chrome 窗口标题实测一堆 `\u200b`），不清洗会污染匹配 |
 | 绝不丢候选 | 词法信号弱时用可点击性兜底，**预筛永不返空** —— 否则正确答案永久出局 |
+| 缓存条目校验 | daemon 里缓存的 `AXUIElement` 按下前先读回 role/窗口标题，变了就报 `stale_ref`，不会拿失效元素静默 `AXPress` |
+
+### 坐标只有一种话
+
+三套坐标混用是"点了没反应"的高发来源，所以契约写死：
+
+```json
+{
+  "coordinateSpace": "screen",
+  "windowRect":   {"x": -1593, "y": 81, "w": 920, "h": 436},
+  "windowOrigin": {"x": -1593, "y": 81}
+}
+```
+
+- `snapshot` 里每个元素的 `rect` 都是**屏幕坐标**，可以直接喂给 `click --xy`。
+- `--space window` 时 `--xy` 是窗口内坐标，工具负责加 `windowOrigin`；输出会回显换算后的 `screen`。
+- `scu shot` 给 `scale` 和 `actionFormula`：图像像素 ÷ scale = 窗口点。别拿图像像素当坐标。
 
 ---
 
@@ -342,7 +394,8 @@ export TYPESAFE_API_KEY=...
 | **Electron app 可能没有 AX 树** | 飞书、Sublime 有时 `AXWindows` 返回 0 个窗口。需要 app 自己打开 `AXManualAccessibility`。兜底是截图 + 坐标 |
 | **矩形截图会串窗口** | `scu shot` 用 `screencapture -R`，盖在目标窗口上的其他窗口会被拍进去。跨 Space / 多屏时可能拍到别的内容。需要纯净窗口图得走 ScreenCaptureKit（要一个 .app 上下文） |
 | **无文字容器排最后** | 兜底候选优先给有文字的元素，纯图标按钮可能选不中，用 ref 或坐标 |
-| **鼠标点击需要窗口在前台** | `--via ax` 可以不动鼠标不抢焦点，但不是所有控件都支持 AXPress |
+| **鼠标点击需要窗口在前台** | `--via ax` 可以不动鼠标不抢焦点，但不是所有控件都支持 AXPress；`--via pid` 能把事件定向投给后台进程，但 app 可能因为窗口不是 key window 而忽略，结果标 `unverified(synthetic_input)` |
+| **daemon 的 app 列表会陈旧** | `NSWorkspace.runningApplications` 依赖 workspace 通知，daemon 没有 runloop，会一直看到启动那刻的快照（新开的 app 永远 `app_not_found`）。已改为 workspace 缓存 + 内核进程表兜底 |
 | **`AXIsProcessTrusted()` 会骗人** | 返回 `true` 不代表真能读。另外**不要**用系统级的 `kAXFocusedApplicationAttribute` 当健康探针 —— 实测正常状态下它也会稳定返回 `-25204`，是假阴性。`scu doctor` 已改成对具体 app 做探针，看 `accessibilityUsable` |
 | **长时间无操作 / 显示器休眠后 AX 会无响应** | 症状：所有 app 的窗口都变成 app 元素本身（没有位置/尺寸），旧二进制也会卡住。回到机器后自行恢复。工具会报 `ax_cannot_complete`(exit 10) 而不是崩溃 |
 | 窗口最小化 / 在别的 Space 时可能取不到 | 这时返回 `no_window`，不是崩溃。先把窗口调出来 |
@@ -385,8 +438,8 @@ docs/design.md               设计取舍与实测数据
 
 | 层 | 文件 | 需要权限 | 说明 |
 |---|---|---|---|
-| 单元 | `tests/test_unit.py` | ❌ | 26 条，覆盖文本清洗、打分器（含"预筛绝不返空"回归）、置信度、记忆、exit code |
-| 集成 | `tests/test_integration.py` | ✅ | 14 条，真读 AX：ref 唯一性与跨快照稳定性、零宽字符清洗、target_ref 可解析、verify、decide 各层、记忆闭环、截图 |
+| 单元 | `tests/test_unit.py` | ❌ | 31 条，覆盖文本清洗、打分器（含"预筛绝不返空"回归）、置信度、记忆、exit code、坐标空间参数契约 |
+| 集成 | `tests/test_integration.py` | ✅ | 27 条，真读 AX：ref 唯一性与跨快照稳定性、坐标契约（`windowRect`/`coordinateSpace`）、零宽字符清洗、target_ref 可解析、verify、pid 投递契约、decide 各层、记忆闭环、截图换算公式 |
 
 集成测试在 AX 不可用（没授权 / 锁屏 / 显示器休眠）时**整体跳过而不是失败**，所以 CI 里也不会红。
 

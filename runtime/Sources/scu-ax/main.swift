@@ -309,13 +309,51 @@ struct AppRef {
     let ax: AXUIElement
 }
 
+/// 实时在跑的 app 列表。
+///
+/// `NSWorkspace.shared.runningApplications` 靠 workspace 通知维护，
+/// 而 daemon 没有 NSApplication runloop，收不到通知 —— 它会一直返回启动那一刻的快照。
+/// 后果：daemon 跑起来之后新开的 app 永远 `app_not_found`。
+/// 直接问内核要进程表，再用 `NSRunningApplication(processIdentifier:)` 包装，不依赖 runloop。
+func liveProcessIDs() -> [pid_t] {
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+    var size = 0
+    guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0, size > 0 else { return [] }
+    let capacity = size / MemoryLayout<kinfo_proc>.stride
+    var procs = [kinfo_proc](repeating: kinfo_proc(), count: capacity)
+    guard sysctl(&mib, UInt32(mib.count), &procs, &size, nil, 0) == 0 else { return [] }
+    let count = size / MemoryLayout<kinfo_proc>.stride
+    return (0..<count).map { procs[$0].kp_proc.p_pid }
+}
+
+func liveApps() -> [NSRunningApplication] {
+    liveProcessIDs().compactMap { NSRunningApplication(processIdentifier: $0) }
+}
+
+/// 按 bundle id / 名字 / 模糊匹配找一个在跑的 app。
+/// 先查 workspace 缓存（快，绝大多数命中），再查内核进程表（慢一点，但能发现新 app）。
+func findRunningApp(_ spec: String) -> NSRunningApplication? {
+    // bundle id 精确查询走 LaunchServices，最便宜
+    if spec.contains(".") {
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: spec)
+            .first(where: { !$0.isTerminated }) {
+            return app
+        }
+    }
+    if let app = matchApp(NSWorkspace.shared.runningApplications, spec) { return app }
+    return matchApp(liveApps(), spec)
+}
+
+func matchApp(_ running: [NSRunningApplication], _ spec: String) -> NSRunningApplication? {
+    let live = running.filter { !$0.isTerminated }
+    return live.first { $0.bundleIdentifier == spec }
+        ?? live.first { $0.localizedName == spec }
+        ?? live.first { ($0.bundleIdentifier ?? "").lowercased().contains(spec.lowercased()) }
+        ?? live.first { ($0.localizedName ?? "").lowercased().contains(spec.lowercased()) }
+}
+
 func resolveApp(_ spec: String) -> AppRef {
-    let running = NSWorkspace.shared.runningApplications
-    let match = running.first { $0.bundleIdentifier == spec }
-        ?? running.first { $0.localizedName == spec }
-        ?? running.first { ($0.bundleIdentifier ?? "").lowercased().contains(spec.lowercased()) }
-        ?? running.first { ($0.localizedName ?? "").lowercased().contains(spec.lowercased()) }
-    guard let app = match else { die("app_not_found: \(spec)", code: 2) }
+    guard let app = findRunningApp(spec) else { die("app_not_found: \(spec)", code: 2) }
     let ax = AXUIElementCreateApplication(app.processIdentifier)
     AXUIElementSetMessagingTimeout(ax, 2.0)
     tryEnableManualAX(app.processIdentifier, ax)
@@ -345,12 +383,7 @@ func tryEnableManualAX(_ pid: pid_t, _ ax: AXUIElement) {
 
 /// 不 exit 的版本 —— daemon 里绝不能用会退出的解析，否则一个坏请求就把服务打死。
 func resolveAppSafe(_ spec: String) -> AppRef? {
-    let running = NSWorkspace.shared.runningApplications
-    let match = running.first { $0.bundleIdentifier == spec }
-        ?? running.first { $0.localizedName == spec }
-        ?? running.first { ($0.bundleIdentifier ?? "").lowercased().contains(spec.lowercased()) }
-        ?? running.first { ($0.localizedName ?? "").lowercased().contains(spec.lowercased()) }
-    guard let app = match else { return nil }
+    guard let app = findRunningApp(spec) else { return nil }
     let ax = AXUIElementCreateApplication(app.processIdentifier)
     AXUIElementSetMessagingTimeout(ax, 2.0)
     tryEnableManualAX(app.processIdentifier, ax)
@@ -379,6 +412,7 @@ struct Snapshot {
     var window: AXUIElement
     var app: AppRef
     var title: String
+    var rect: CGRect? = nil
     var truncated: Bool = false
     var cycles: Int = 0
 }
@@ -419,9 +453,10 @@ func windowRect(_ w: AXUIElement) -> CGRect? {
 func snapshot(_ spec: String, maxN: Int = 4000, maxDepth: Int = 20,
               visibleOnly: Bool = true, withActions: Bool = true) -> Snapshot? {
     guard let a = resolveAppSafe(spec), let w = targetWindow(a) else { return nil }
+    let wr = windowRect(w)
     // 窗口矩形 ∩ 它所在屏幕的可用区域 = 真正看得见的部分
     var visible: CGRect? = nil
-    if visibleOnly, let wr = windowRect(w) {
+    if visibleOnly, let wr {
         for scr in NSScreen.screens where scr.frame.intersects(wr) {
             visible = wr.intersection(scr.visibleFrame)
             break
@@ -435,7 +470,7 @@ func snapshot(_ spec: String, maxN: Int = 4000, maxDepth: Int = 20,
     assignRefs(&out, sigs: sigs, keep: keep)
     return Snapshot(nodes: out, elems: elems, keep: keep, window: w,
                     app: a, title: asText(attr(w, kAXTitleAttribute)) ?? "",
-                    truncated: truncated, cycles: cycles)
+                    rect: wr, truncated: truncated, cycles: cycles)
 }
 
 // MARK: - 渲染
@@ -495,7 +530,13 @@ func toJSON(_ s: Snapshot) -> [String: Any] {
                                   "pid": Int(s.app.app.processIdentifier),
                                   "app": s.app.app.localizedName ?? "",
                                   "bundle": s.app.app.bundleIdentifier ?? "",
-                                  "window": s.title, "elements": out]
+                                  "window": s.title, "elements": out,
+                                  "coordinateSpace": "screen"]
+    if let r = s.rect {
+        payload["windowRect"] = ["x": r.origin.x, "y": r.origin.y,
+                                 "w": r.width, "h": r.height]
+        payload["windowOrigin"] = ["x": r.origin.x, "y": r.origin.y]
+    }
     if s.truncated { payload["truncated"] = true }
     if s.cycles > 0 { payload["cyclesDetected"] = s.cycles }
     return payload
@@ -525,21 +566,44 @@ func activate(_ a: AppRef) {
     nap(35)
 }
 
-func mouseClick(at p: CGPoint, button: CGMouseButton = .left, count: Int = 1, holdMs: Int = 12) {
+/// 事件往哪送。
+///
+/// `global` 塞进系统事件流：谁在前台就归谁。目标不在前台时，事件会落到
+/// 用户正在用的窗口上 —— 这是"静默串窗"的根因。
+/// `pid` 直接投递给目标进程的事件队列：不移动真实光标、不抢焦点，
+/// 代价是目标 app 可能因为窗口不是 key window 而丢弃它（所以结果标 unverified）。
+enum EventRoute {
+    case global
+    case pid(pid_t)
+
+    var isPid: Bool { if case .pid = self { return true }; return false }
+    var label: String { isPid ? "pid" : "global" }
+}
+
+func send(_ ev: CGEvent?, _ route: EventRoute) {
+    guard let ev else { return }
+    switch route {
+    case .global: ev.post(tap: .cghidEventTap)
+    case .pid(let p): ev.postToPid(p)
+    }
+}
+
+func mouseClick(at p: CGPoint, button: CGMouseButton = .left, count: Int = 1, holdMs: Int = 12,
+                route: EventRoute = .global) {
     let src = CGEventSource(stateID: .hidSystemState)
     let (down, up): (CGEventType, CGEventType) = button == .right
         ? (.rightMouseDown, .rightMouseUp) : (.leftMouseDown, .leftMouseUp)
     // 只保留事件顺序所需的最小间隔。
     // 实测/Codex 的做法一致：输入立刻发，等待放在「取状态」那一侧自适应做。
-    CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: button)?
-        .post(tap: .cghidEventTap)
+    send(CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: button),
+         route)
     nap(2)
     for _ in 0..<max(1, count) {
-        CGEvent(mouseEventSource: src, mouseType: down, mouseCursorPosition: p, mouseButton: button)?
-            .post(tap: .cghidEventTap)
+        send(CGEvent(mouseEventSource: src, mouseType: down, mouseCursorPosition: p, mouseButton: button),
+             route)
         nap(Double(holdMs))
-        CGEvent(mouseEventSource: src, mouseType: up, mouseCursorPosition: p, mouseButton: button)?
-            .post(tap: .cghidEventTap)
+        send(CGEvent(mouseEventSource: src, mouseType: up, mouseCursorPosition: p, mouseButton: button),
+             route)
         nap(2)
     }
 }
@@ -567,37 +631,51 @@ let MODIFIERS: [String: CGEventFlags] = [
     "shift": .maskShift, "fn": .maskSecondaryFn,
 ]
 
-func parseChord(_ chord: String) -> (CGKeyCode, CGEventFlags) {
+func scrollWheel(at p: CGPoint, dy: Int32, route: EventRoute = .global) {
+    let src = CGEventSource(stateID: .hidSystemState)
+    send(CGEvent(mouseEventSource: src, mouseType: .mouseMoved,
+                 mouseCursorPosition: p, mouseButton: .left), route)
+    send(CGEvent(scrollWheelEvent2Source: src, units: .line, wheelCount: 1,
+                 wheel1: dy, wheel2: 0, wheel3: 0), route)
+}
+
+/// 解析组合键。返回 nil 表示不认识 —— daemon 里不能 die，否则一个坏请求就把服务打死。
+func parseKey(_ chord: String) -> (CGKeyCode, CGEventFlags)? {
     let parts = chord.lowercased()
         .split(separator: "+")
         .map { $0.trimmingCharacters(in: .whitespaces) }
         .filter { !$0.isEmpty }
-    guard let keyName = parts.last else { die("invalid_key: \(chord)", code: 4) }
+    guard let keyName = parts.last else { return nil }
     var flags: CGEventFlags = []
     for m in parts.dropLast() {
-        guard let f = MODIFIERS[m] else { die("unknown_modifier: \(m)", code: 4) }
+        guard let f = MODIFIERS[m] else { return nil }
         flags.insert(f)
     }
-    guard let code = KEYCODES[keyName] else { die("unknown_key: \(keyName)", code: 4) }
+    guard let code = KEYCODES[keyName] else { return nil }
     return (code, flags)
 }
 
-func pressKey(_ chord: String) {
-    let (code, flags) = parseChord(chord)
+func parseChord(_ chord: String) -> (CGKeyCode, CGEventFlags) {
+    guard let r = parseKey(chord) else { die("invalid_key: \(chord)", code: 4) }
+    return r
+}
+
+func pressKey(_ chord: String, route: EventRoute = .global) {
+    guard let (code, flags) = parseKey(chord) else { return }
     let src = CGEventSource(stateID: .hidSystemState)
     let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true)
     let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false)
     down?.flags = flags
     up?.flags = flags
-    down?.post(tap: .cghidEventTap)
+    send(down, route)
     usleep(15_000)
-    up?.post(tap: .cghidEventTap)
+    send(up, route)
     usleep(15_000)
 }
 
 /// 长文本走剪贴板粘贴：逐字合成是 4ms/字，26 个字就 100ms+。
 /// 粘贴是一次 ⌘V，而且不会因为输入法状态丢字。
-func pasteText(_ text: String) -> Bool {
+func pasteText(_ text: String, route: EventRoute = .global) -> Bool {
     let pb = NSPasteboard.general
     let saved = pb.string(forType: .string)
     pb.clearContents()
@@ -609,9 +687,9 @@ func pasteText(_ text: String) -> Bool {
     let up = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: false)
     down?.flags = .maskCommand
     up?.flags = .maskCommand
-    down?.post(tap: .cghidEventTap)
+    send(down, route)
     usleep(15_000)
-    up?.post(tap: .cghidEventTap)
+    send(up, route)
     usleep(60_000)
     // 还原用户原来的剪贴板
     if let s = saved {
@@ -621,16 +699,16 @@ func pasteText(_ text: String) -> Bool {
     return true
 }
 
-func typeText(_ text: String) {
+func typeText(_ text: String, route: EventRoute = .global) {
     let src = CGEventSource(stateID: .hidSystemState)
     for scalar in text {
         var utf16 = Array(String(scalar).utf16)
         guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) else { continue }
         down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        down.post(tap: .cghidEventTap)
+        send(down, route)
         guard let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else { continue }
         up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        up.post(tap: .cghidEventTap)
+        send(up, route)
         nap(1.5)
     }
 }
@@ -683,6 +761,15 @@ func centerOf(_ nodes: [Node], _ i: Int, keep: [Bool]) -> CGPoint? {
         cur = nodes[cur].parent
     }
     return nil
+}
+
+/// 元素中心点（屏幕坐标）。daemon 里没有节点数组，直接读属性。
+func elementCenter(_ el: AXUIElement) -> CGPoint? {
+    var p = CGPoint.zero, sz = CGSize.zero
+    if let pv = attr(el, kAXPositionAttribute) { AXValueGetValue(pv as! AXValue, .cgPoint, &p) }
+    if let sv = attr(el, kAXSizeAttribute) { AXValueGetValue(sv as! AXValue, .cgSize, &sz) }
+    guard sz.width > 0, sz.height > 0 else { return nil }
+    return CGPoint(x: p.x + sz.width / 2, y: p.y + sz.height / 2)
 }
 
 // MARK: - 命令
@@ -817,18 +904,255 @@ func findAndPressMenuItem(_ appAx: AXUIElement, key: String, mods: Int) -> Bool 
     return pressed
 }
 
-/// 往元素里写字，不需要焦点。
-func writeText(into el: AXUIElement, _ text: String) -> Bool {
-    // 可编辑控件：优先在光标处插入，其次整体赋值
-    if AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
-        return true
-    }
+/// 整体赋值（`set` 语义）。先试 AXValue，再退回插入。
+func setValue(into el: AXUIElement, _ text: String) -> Bool {
     if AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFTypeRef) == .success {
         return true
     }
-    return false
+    return AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success
 }
 
+/// 在光标处插入（`type` 语义），不需要焦点。
+func insertText(into el: AXUIElement, _ text: String) -> Bool {
+    if AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
+        return true
+    }
+    return AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFTypeRef) == .success
+}
+
+// MARK: - 结果契约：动作到底生效了没有
+//
+// `ok: true` 只说明"无障碍调用返回了 success"，不说明界面上真的发生了什么。
+// 每个动作都带 verification：
+//   verified   —— 读回值匹配。这是唯一能证明"输入真的落地"的形态。
+//   unverified —— 合成输入投出去就管不着了，或者 AX 调用本身无法断言。
+// 调用方不许把 unverified 当成功上报。
+
+func verified(_ source: String) -> [String: Any] { ["state": "verified", "source": source] }
+func unverified(_ reason: String) -> [String: Any] { ["state": "unverified", "reason": reason] }
+
+/// 读回元素当前文本，用来验证写入。
+func readBack(_ el: AXUIElement) -> String? {
+    if let v = attr(el, kAXValueAttribute), let s = asText(v) { return s }
+    if let v = attr(el, kAXSelectedTextAttribute), let s = asText(v) { return s }
+    return nil
+}
+
+/// 写入后的读回判定。
+/// 只有"值变了且包含预期文本"才算 verified —— 单纯 contains 在"字段里本来就有这串字"时会误判。
+func verifyWrite(_ el: AXUIElement, before: String?, expected: String) -> [String: Any] {
+    guard let after = readBack(el) else { return unverified("provider_unavailable") }
+    let changed = before == nil || after != before
+    if changed && (after == expected || after.hasSuffix(expected) || after.contains(expected)) {
+        return verified("value_readback")
+    }
+    var out = unverified(changed ? "value_mismatch" : "value_unchanged")
+    out["actualPreview"] = String(after.prefix(80))
+    return out
+}
+
+// MARK: - 坐标空间
+//
+// 动作坐标默认是**屏幕点**（AX 的 position / CGEvent 的 location 都是这个空间）。
+// `--space window` 让调用方直接传窗口内坐标（原点 = 窗口左上角），
+// 由这里换算 —— 多屏和负坐标下调用方不用自己减窗口原点。
+
+func windowOrigin(_ spec: String) -> CGPoint? {
+    guard let a = resolveAppSafe(spec), let w = targetWindow(a), let r = windowRect(w) else {
+        return nil
+    }
+    return r.origin
+}
+
+func toScreenPoint(_ p: CGPoint, appSpec: String, space: String) -> CGPoint? {
+    guard space == "window" else { return p }
+    guard let o = windowOrigin(appSpec) else { return nil }
+    return CGPoint(x: p.x + o.x, y: p.y + o.y)
+}
+
+/// 坐标相关的输出统一带上空间和换算结果，别再让调用方猜。
+func pointPayload(_ screen: CGPoint, space: String) -> [String: Any] {
+    ["coordinateSpace": space, "screen": ["x": screen.x, "y": screen.y]]
+}
+
+
+// MARK: - 浮动状态条
+//
+// 只做展示：无边框 NSPanel、不抢焦点、鼠标穿透。
+// 它跑在 daemon 进程里，不是独立 .app —— 不需要任何额外 TCC 权限，
+// 换来的是一条看得见的状态：正在做什么、结果是 verified 还是 unverified。
+//
+// SCU_HUD=0 关闭（CI / 无 WindowServer）；SCU_HUD_POS=bottom 贴屏幕底部。
+
+final class StatusHUD {
+    static let shared = StatusHUD()
+
+    private var panel: NSPanel?
+    private var dot: NSView?
+    private var titleLabel: NSTextField?
+    private var detailLabel: NSTextField?
+    private var hideTask: DispatchWorkItem?
+
+    private let width: CGFloat = 320
+    private let height: CGFloat = 52
+
+    private var enabled: Bool {
+        ProcessInfo.processInfo.environment["SCU_HUD"] != "0"
+    }
+
+    /// 动作开始：先亮出来，避免"黑箱操作"。
+    func begin(cmd: String, app: String) {
+        show(title: "scu · \(cmd)", detail: app, color: .systemBlue, autoHide: false)
+    }
+
+    /// 动作结束：状态色 + verification 原因。
+    func finish(cmd: String, payload: [String: Any]) {
+        let ok = (payload["ok"] as? Bool) ?? false
+        let verification = payload["verification"] as? [String: Any]
+        let state = verification?["state"] as? String
+        let reason = (verification?["reason"] as? String) ?? (payload["reasonCode"] as? String)
+        let via = payload["via"] as? String
+
+        var color = NSColor.systemGreen
+        var detail = "ok"
+        if !ok {
+            color = .systemRed
+            detail = reason ?? "failed"
+        } else if state == "verified" {
+            detail = "verified"
+        } else if state == "unverified" {
+            color = .systemOrange
+            detail = "unverified" + (reason.map { " · \($0)" } ?? "")
+        }
+        if let via, !via.isEmpty { detail += " · via \(via)" }
+        show(title: "scu · \(cmd)", detail: detail, color: color, autoHide: true)
+    }
+
+    private func show(title: String, detail: String, color: NSColor, autoHide: Bool) {
+        guard enabled else { return }
+        DispatchQueue.main.async {
+            let p = self.ensurePanel()
+            self.titleLabel?.stringValue = title
+            self.detailLabel?.stringValue = detail
+            self.dot?.layer?.backgroundColor = color.cgColor
+            self.resize(p, title: title, detail: detail)
+            self.position(p)
+            self.hideTask?.cancel()
+            self.hideTask = nil
+            p.alphaValue = 1
+            p.orderFrontRegardless()
+            if autoHide { self.scheduleHide() }
+        }
+    }
+
+    /// 宽度跟着内容走：一句 "ok" 和一句 "unverified · value_mismatch · via pid"
+    /// 不该占同样大的块。
+    private func resize(_ p: NSPanel, title: String, detail: String) {
+        let titleFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let detailFont = NSFont.systemFont(ofSize: 11)
+        let titleWidth = (title as NSString).size(withAttributes: [.font: titleFont]).width
+        let detailWidth = (detail as NSString).size(withAttributes: [.font: detailFont]).width
+        let width = min(460, max(180, max(titleWidth, detailWidth) + 58))
+        if abs(p.frame.width - width) > 0.5 {
+            p.setContentSize(NSSize(width: width, height: height))
+        }
+    }
+
+    private func scheduleHide() {
+        let task = DispatchWorkItem { [weak self] in self?.fadeOut() }
+        hideTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: task)
+    }
+
+    private func fadeOut() {
+        guard let p = panel, p.alphaValue > 0 else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.2
+            p.animator().alphaValue = 0
+        }, completionHandler: {
+            p.orderOut(nil)
+        })
+    }
+
+    private func position(_ p: NSPanel) {
+        // NSScreen.main 是"当前活动屏"，daemon 没有 key window 时可能指向副屏，
+        // 算出来的 Y 会跑到屏幕外。主屏固定是 screens 的第一个（菜单栏所在）。
+        guard let screen = NSScreen.screens.first ?? NSScreen.main else { return }
+        let f = screen.visibleFrame
+        let x = f.midX - p.frame.width / 2
+        let y = ProcessInfo.processInfo.environment["SCU_HUD_POS"] == "bottom"
+            ? f.minY + 28
+            : f.maxY - p.frame.height - 12
+        p.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func ensurePanel() -> NSPanel {
+        if let panel { return panel }
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.isFloatingPanel = true
+        p.level = .statusBar
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.ignoresMouseEvents = true
+        p.hidesOnDeactivate = false
+        p.isReleasedWhenClosed = false
+        p.alphaValue = 0
+
+        let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        effect.material = .hudWindow
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.appearance = NSAppearance(named: .vibrantDark)
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 12
+        effect.layer?.masksToBounds = true
+        effect.autoresizingMask = [.width, .height]
+
+        // 视觉材质在浅色页面上会发灰，压一层深色保证对比稳定
+        let tint = NSView(frame: effect.bounds)
+        tint.wantsLayer = true
+        tint.layer?.backgroundColor = NSColor(white: 0.06, alpha: 0.46).cgColor
+        tint.autoresizingMask = [.width, .height]
+        effect.addSubview(tint)
+
+        let dotView = NSView(frame: NSRect(x: 16, y: height / 2 - 4, width: 8, height: 8))
+        dotView.wantsLayer = true
+        dotView.layer?.cornerRadius = 4
+        dotView.layer?.backgroundColor = NSColor.systemGreen.cgColor
+        effect.addSubview(dotView)
+        dot = dotView
+
+        let title = NSTextField(labelWithString: "")
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        title.textColor = .white
+        title.lineBreakMode = .byTruncatingTail
+        title.frame = NSRect(x: 34, y: height / 2 + 1, width: width - 48, height: 16)
+        title.autoresizingMask = [.width]
+        effect.addSubview(title)
+        titleLabel = title
+
+        let detail = NSTextField(labelWithString: "")
+        detail.font = .systemFont(ofSize: 11)
+        detail.textColor = NSColor(white: 1, alpha: 0.72)
+        detail.lineBreakMode = .byTruncatingTail
+        detail.frame = NSRect(x: 34, y: height / 2 - 16, width: width - 48, height: 15)
+        detail.autoresizingMask = [.width]
+        effect.addSubview(detail)
+        detailLabel = detail
+
+        p.contentView = effect
+        panel = p
+        return p
+    }
+}
+
+/// 当前请求里正在执行的写动作，供 writeLine 收尾时更新 HUD。
+/// handleClient 是串行执行的，所以不需要锁。
+var hudCommand: String? = nil
 
 // MARK: - 常驻 daemon：消除「每步重走全树」
 //
@@ -864,6 +1188,26 @@ func cacheStore(_ snap: Snapshot) {
     }
 }
 
+/// 缓存里的 AXUIElement 可能指向已经销毁/重建的控件。
+/// 按下之前确认它还是缓存时那个：角色没变、窗口标题没变。
+/// 读不到窗口属性就当通过（菜单项之类的元素本来就没有窗口）。
+func cacheStale(_ ref: String) -> [String: Any]? {
+    guard let el = cache[ref], let meta = cacheMeta[ref] else { return nil }
+    let role = asText(attr(el, kAXRoleAttribute)) ?? ""
+    if let want = meta["role"] as? String, !want.isEmpty, role != want {
+        return ["ok": false, "reasonCode": "stale_ref", "ref": ref, "why": "role_changed",
+                "expected": want, "actual": role]
+    }
+    if !cacheWindow.isEmpty, let wv = attr(el, kAXWindowAttribute) {
+        let w = wv as! AXUIElement
+        if let t = asText(attr(w, kAXTitleAttribute)), t != cacheWindow {
+            return ["ok": false, "reasonCode": "stale_ref", "ref": ref, "why": "window_changed",
+                    "expectedWindow": cacheWindow, "actualWindow": t]
+        }
+    }
+    return nil
+}
+
 /// 在缓存元素上直接执行"按压类"动作。不重走树。
 func cachedPress(_ ref: String) -> [String: Any] {
     // 先试自己，再试归属的可点祖先 —— 都从缓存拿，不重走树
@@ -872,13 +1216,19 @@ func cachedPress(_ ref: String) -> [String: Any] {
 
     for candidate in chain {
         guard let el = cache[candidate] else { continue }
+        if let stale = cacheStale(candidate) {
+            // 目标自己失效就直接报错；祖先失效就换下一个候选
+            if candidate == ref { return stale }
+            continue
+        }
         var acts: CFArray?
         AXUIElementCopyActionNames(el, &acts)
         let list = (acts as? [String]) ?? []
         for want in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where list.contains(want) {
             if AXUIElementPerformAction(el, want as CFString) == .success {
                 var r: [String: Any] = ["ok": true, "op": "click", "ref": ref,
-                                        "action": want, "via": "daemon-cache"]
+                                        "action": want, "via": "daemon-cache",
+                                        "verification": unverified("axpress_unasserted")]
                 if candidate != ref { r["pressedAncestor"] = candidate }
                 return r
             }
@@ -889,11 +1239,17 @@ func cachedPress(_ ref: String) -> [String: Any] {
 }
 
 func writeLine(_ fd: Int32, _ obj: [String: Any]) {
-    guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return }
-    var payload = data
-    payload.append(0x0A)
-    payload.withUnsafeBytes { buf in
-        _ = Darwin.write(fd, buf.baseAddress, buf.count)
+    if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) {
+        var payload = data
+        payload.append(0x0A)
+        payload.withUnsafeBytes { buf in
+            _ = Darwin.write(fd, buf.baseAddress, buf.count)
+        }
+    }
+    // 响应已经发走，再做 UI —— 展示不能拖慢调用方
+    if let cmd = hudCommand, obj["ok"] != nil {
+        StatusHUD.shared.finish(cmd: cmd, payload: obj)
+        hudCommand = nil
     }
 }
 
@@ -923,6 +1279,10 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     }
     // 注意：这里**不** cacheStore —— 轻量快照没有动作列表，覆盖缓存会让后续点击失效
     let sigBefore = signature(before)
+    let space = (req["space"] as? String) ?? "screen"
+    let wantActivate = (req["activate"] as? Bool) == true
+    let route: EventRoute = resolveAppSafe(appSpec)
+        .map { .pid($0.app.processIdentifier) } ?? .global
 
     // ---- 执行 ----
     let tActStart = Date()
@@ -933,44 +1293,90 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
             if let fresh = snapshot(appSpec) { cacheStore(fresh) }
             actResult = cachedPress(ref)
         }
+        if (actResult["reasonCode"] as? String) == "cache_miss" {
+            actResult = ["ok": false, "reasonCode": "stale_ref", "ref": ref]
+        }
+        // 动作本身失败了就别再等界面变化
+        if (actResult["ok"] as? Bool) != true { return actResult }
     } else if let x = req["x"] as? Double, let y = req["y"] as? Double {
-        if (req["mouse"] as? Bool) == true {
-            guard let app = resolveAppSafe(appSpec) else {
-                return ["ok": false, "reasonCode": "app_not_found"]
-            }
+        guard let app = resolveAppSafe(appSpec) else {
+            return ["ok": false, "reasonCode": "app_not_found"]
+        }
+        guard let screen = toScreenPoint(CGPoint(x: x, y: y), appSpec: appSpec, space: space) else {
+            return ["ok": false, "reasonCode": "window_not_found"]
+        }
+        let mouseButton: CGMouseButton = (req["button"] as? String) == "right" ? .right : .left
+        let count = (req["count"] as? Int) ?? 1
+        if (req["mouse"] as? Bool) == true || (req["via"] as? String) == "mouse" {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
                 activate(app)
             }
-            mouseClick(at: CGPoint(x: x, y: y), count: (req["count"] as? Int) ?? 1)
-            actResult = ["ok": true, "via": "mouse"]
+            mouseClick(at: screen, button: mouseButton, count: count)
+            actResult = ["ok": true, "via": "mouse", "verification": unverified("synthetic_input")]
+        } else if (req["via"] as? String) == "pid" {
+            mouseClick(at: screen, button: mouseButton, count: count,
+                       route: .pid(app.app.processIdentifier))
+            actResult = ["ok": true, "via": "pid-mouse", "verification": unverified("synthetic_input")]
         } else {
-            guard let app = resolveAppSafe(appSpec), let hit = elementAtPoint(app.app.processIdentifier, CGPoint(x: x, y: y)),
+            guard let hit = elementAtPoint(app.app.processIdentifier, screen),
                   let t = pressable(hit) else {
                 return ["ok": false, "reasonCode": "no_ax_action_at_point"]
             }
             let err = AXUIElementPerformAction(t.element, t.action as CFString)
-            actResult = ["ok": err == .success, "via": "hit-test", "action": t.action]
+            actResult = ["ok": err == .success, "via": "hit-test", "action": t.action,
+                         "verification": unverified("axpress_unasserted")]
+            if err != .success { actResult["reasonCode"] = "ax_action_failed" }
         }
+        actResult.merge(pointPayload(screen, space: space)) { _, new in new }
     } else if let text = req["text"] as? String {
         guard let app = resolveAppSafe(appSpec) else {
             return ["ok": false, "reasonCode": "app_not_found"]
         }
-        var f: CFTypeRef?
-        if AXUIElementCopyAttributeValue(app.ax, kAXFocusedUIElementAttribute as CFString, &f) == .success,
-           let el = f as! AXUIElement?, writeText(into: el, text) {
-            actResult = ["ok": true, "via": "ax"]
+        var targetEl: AXUIElement?
+        if let ref = req["ref"] as? String {
+            if cache[ref] == nil, let fresh = snapshot(appSpec) { cacheStore(fresh) }
+            if let stale = cacheStale(ref) { return stale }
+            guard cache[ref] != nil else { return ["ok": false, "reasonCode": "stale_ref", "ref": ref] }
+            targetEl = cache[ref]
         } else {
-            return ["ok": false, "reasonCode": "needs_takeover"]
+            var f: CFTypeRef?
+            if AXUIElementCopyAttributeValue(app.ax, kAXFocusedUIElementAttribute as CFString, &f) == .success {
+                targetEl = (f as! AXUIElement)
+            }
+        }
+        var wrote = false
+        if let el = targetEl {
+            let previous = readBack(el)
+            if insertText(into: el, text) {
+                wrote = true
+                actResult = ["ok": true, "via": "ax",
+                             "verification": verifyWrite(el, before: previous, expected: text)]
+            }
+        }
+        if !wrote {
+            // AX 写不进去（webview / 自绘控件）：定向投递键盘，不抢焦点。
+            typeText(text, route: route)
+            actResult = ["ok": true, "via": route.label == "pid" ? "pid" : "keyboard",
+                         "verification": unverified("synthetic_input")]
         }
     } else if let k = req["key"] as? String {
+        guard parseKey(k) != nil else {
+            return ["ok": false, "reasonCode": "invalid_key", "key": k]
+        }
         guard let app = resolveAppSafe(appSpec) else {
             return ["ok": false, "reasonCode": "app_not_found"]
         }
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
+        if wantActivate,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
             activate(app)
         }
-        pressKey(k)
-        actResult = ["ok": true, "via": "keyboard"]
+        if wantActivate {
+            pressKey(k)
+            actResult = ["ok": true, "via": "keyboard", "verification": unverified("synthetic_input")]
+        } else {
+            pressKey(k, route: .pid(app.app.processIdentifier))
+            actResult = ["ok": true, "via": "pid", "verification": unverified("synthetic_input")]
+        }
     } else {
         return ["ok": false, "reasonCode": "bad_args"]
     }
@@ -995,8 +1401,27 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     out["actMs"] = actMs
     out["waitedMs"] = waited
     out["before"] = sigBefore
+    // AX 动作可能返回失败但已经生效（典型：AXOpen 打开视图后把被点的行销毁了）。
+    // 界面确实变了就是更强的证据：ok 转 true，原始错误留在 providerError 里。
+    if changed, (out["ok"] as? Bool) != true {
+        out["providerError"] = out["reasonCode"] ?? "ax_action_failed"
+        out["reasonCode"] = ""
+        out["ok"] = true
+    }
+    out["verification"] = combineVerification(out["verification"] as? [String: Any], changed: changed)
     if !changed { out["note"] = "界面没有变化：动作可能没生效，或者这个动作本来就不改界面" }
     return out
+}
+
+/// 合成输入的 unverified 不能因为"界面变了"就升级成 verified ——
+/// 变了不等于这串字落到了你以为的那个输入框。
+func combineVerification(_ base: [String: Any]?, changed: Bool) -> [String: Any] {
+    if let base, (base["state"] as? String) == "verified" { return base }
+    if let base, let reason = base["reason"] as? String,
+       reason != "axpress_unasserted" {
+        return base
+    }
+    return changed ? verified("ui_changed") : (base ?? unverified("ui_unchanged"))
 }
 
 func handleClient(_ fd: Int32) {
@@ -1018,6 +1443,13 @@ func handleClient(_ fd: Int32) {
     let cmd = req["cmd"] as? String ?? ""
     let appSpec = req["app"] as? String ?? ""
 
+    // 只有写动作上 HUD；snapshot/ping 之类不弹，否则屏幕会一直闪。
+    let hudWorthy = ["click", "set", "type", "key", "scroll", "actAndWait"].contains(cmd)
+    hudCommand = hudWorthy ? cmd : nil
+    if hudWorthy {
+        StatusHUD.shared.begin(cmd: cmd, app: appSpec)
+    }
+
     switch cmd {
     case "ping":
         writeLine(fd, ["ok": true, "pid": getpid(), "cached": cache.count, "app": cacheApp])
@@ -1027,7 +1459,7 @@ func handleClient(_ fd: Int32) {
         let t0 = Date()
         guard resolveAppSafe(appSpec) != nil else {
             writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec,
-                           "running": NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }.sorted().prefix(40).map { $0 }])
+                           "running": liveApps().compactMap { $0.bundleIdentifier }.sorted().prefix(40).map { $0 }])
             return
         }
         let wantActions = (req["actions"] as? Bool) ?? true
@@ -1061,38 +1493,75 @@ func handleClient(_ fd: Int32) {
             }
             writeLine(fd, r)
         } else if let x = req["x"] as? Double, let y = req["y"] as? Double,
-                  (req["mouse"] as? Bool) == true {
-            // 真鼠标点击（Electron 等没有 AX 的场景）。只在必要时激活，避免每次 35ms。
+                  ((req["mouse"] as? Bool) == true || (req["via"] as? String) == "pid"
+                   || (req["via"] as? String) == "mouse") {
+            // 坐标点击。默认 pid：定向投递，不移动光标、不抢焦点。
+            // mouse = 真鼠标：会移动指针，必须显式要求。
+            let space = (req["space"] as? String) ?? "screen"
+            guard let screen = toScreenPoint(CGPoint(x: x, y: y), appSpec: appSpec, space: space) else {
+                writeLine(fd, ["ok": false, "reasonCode": "window_not_found",
+                               "hint": "--space window 需要目标 app 有可读窗口"]); return
+            }
             guard let app = resolveAppSafe(appSpec) else {
                 writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
             }
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
-                activate(app)
+            let mouseButton: CGMouseButton = (req["button"] as? String) == "right" ? .right : .left
+            let count = (req["count"] as? Int) ?? 1
+            if (req["via"] as? String) == "pid" {
+                mouseClick(at: screen, button: mouseButton, count: count,
+                           route: .pid(app.app.processIdentifier))
+                var out: [String: Any] = ["ok": true, "op": "click", "via": "pid-mouse",
+                                          "verification": unverified("synthetic_input")]
+                out.merge(pointPayload(screen, space: space)) { _, new in new }
+                writeLine(fd, out)
+            } else {
+                if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
+                    activate(app)
+                }
+                mouseClick(at: screen, button: mouseButton, count: count)
+                var out: [String: Any] = ["ok": true, "op": "click", "via": "daemon-mouse",
+                                          "verification": unverified("synthetic_input")]
+                out.merge(pointPayload(screen, space: space)) { _, new in new }
+                writeLine(fd, out)
             }
-            mouseClick(at: CGPoint(x: x, y: y), count: (req["count"] as? Int) ?? 1)
-            writeLine(fd, ["ok": true, "op": "click", "via": "daemon-mouse", "x": x, "y": y])
         } else if let x = req["x"] as? Double, let y = req["y"] as? Double {
+            let space = (req["space"] as? String) ?? "screen"
+            guard let screen = toScreenPoint(CGPoint(x: x, y: y), appSpec: appSpec, space: space) else {
+                writeLine(fd, ["ok": false, "reasonCode": "window_not_found"]); return
+            }
             guard let app = resolveAppSafe(appSpec) else {
                 writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
             }
-            guard let hit = elementAtPoint(app.app.processIdentifier, CGPoint(x: x, y: y)),
+            guard let hit = elementAtPoint(app.app.processIdentifier, screen),
                   let t = pressable(hit) else {
                 writeLine(fd, ["ok": false, "reasonCode": "no_ax_action_at_point"])
                 return
             }
             let err = AXUIElementPerformAction(t.element, t.action as CFString)
-            writeLine(fd, ["ok": err == .success, "action": t.action, "via": "daemon-hit-test"])
+            var out: [String: Any] = ["ok": err == .success, "action": t.action,
+                                      "via": "daemon-hit-test",
+                                      "verification": unverified("axpress_unasserted")]
+            out.merge(pointPayload(screen, space: space)) { _, new in new }
+            writeLine(fd, out)
         } else {
             writeLine(fd, ["ok": false, "reasonCode": "bad_args"])
         }
 
     case "set":
-        guard let ref = req["ref"] as? String, let v = req["value"] as? String,
-              let el = cache[ref] else {
+        guard let ref = req["ref"] as? String, let v = req["value"] as? String else {
+            writeLine(fd, ["ok": false, "reasonCode": "bad_args"]); return
+        }
+        // daemon 刚重启 / 缓存被清空时，先补一次快照再动作
+        if cache[ref] == nil, let snap = snapshot(appSpec) { cacheStore(snap) }
+        guard let el = cache[ref] else {
             writeLine(fd, ["ok": false, "reasonCode": "cache_miss"]); return
         }
-        let ok = writeText(into: el, v)
-        writeLine(fd, ["ok": ok, "ref": ref])
+        if let stale = cacheStale(ref) { writeLine(fd, stale); return }
+        let before = readBack(el)
+        let ok = setValue(into: el, v)
+        writeLine(fd, ["ok": ok, "ref": ref, "via": "ax",
+                       "verification": ok ? verifyWrite(el, before: before, expected: v)
+                                          : unverified("set_failed")])
 
     case "type":
         guard let t = req["text"] as? String else {
@@ -1101,13 +1570,30 @@ func handleClient(_ fd: Int32) {
         guard let app = resolveAppSafe(appSpec) else {
             writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
         }
-        var focused: CFTypeRef?
-        if AXUIElementCopyAttributeValue(app.ax, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-           let el = focused as! AXUIElement?, writeText(into: el, t) {
-            writeLine(fd, ["ok": true, "chars": t.count, "via": "ax"])
+        var targetEl: AXUIElement?
+        if let ref = req["ref"] as? String {
+            if cache[ref] == nil, let snap = snapshot(appSpec) { cacheStore(snap) }
+            if let stale = cacheStale(ref) { writeLine(fd, stale); return }
+            targetEl = cache[ref]
         } else {
-            writeLine(fd, ["ok": false, "reasonCode": "needs_takeover"])
+            var focused: CFTypeRef?
+            if AXUIElementCopyAttributeValue(app.ax, kAXFocusedUIElementAttribute as CFString, &focused) == .success {
+                targetEl = (focused as! AXUIElement)
+            }
         }
+        if let el = targetEl {
+            let before = readBack(el)
+            if insertText(into: el, t) {
+                writeLine(fd, ["ok": true, "chars": t.count, "via": "ax",
+                               "verification": verifyWrite(el, before: before, expected: t)])
+                return
+            }
+        }
+        // AX 写不进去：定向投递键盘事件。不激活 app，所以不会打断正在用电脑的人；
+        // 代价是目标窗口不是 key window 时事件可能被丢弃 —— 结果标 unverified。
+        typeText(t, route: .pid(app.app.processIdentifier))
+        writeLine(fd, ["ok": true, "chars": t.count, "via": "pid",
+                       "verification": unverified("synthetic_input")])
 
     case "actAndWait":
         let timeout = (req["timeoutMs"] as? Int) ?? 1500
@@ -1130,14 +1616,80 @@ func handleClient(_ fd: Int32) {
         guard let k = req["key"] as? String else {
             writeLine(fd, ["ok": false, "reasonCode": "bad_args"]); return
         }
+        guard parseKey(k) != nil else {
+            writeLine(fd, ["ok": false, "reasonCode": "invalid_key", "key": k]); return
+        }
         guard let app = resolveAppSafe(appSpec) else {
             writeLine(fd, ["ok": false, "reasonCode": "app_not_found", "app": appSpec]); return
         }
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
-            activate(app)
+        // 默认：先查菜单栏（后台就能触发，最可靠），再定向投递。
+        // 需要真键盘（焦点已在目标窗口）时传 activate=true。
+        if (req["activate"] as? Bool) == true {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
+                activate(app)
+            }
+            pressKey(k)
+            writeLine(fd, ["ok": true, "op": "key", "key": k, "via": "keyboard",
+                           "verification": unverified("synthetic_input")])
+        } else {
+            if let (key, mods) = chordToMenuItem(k),
+               findAndPressMenuItem(app.ax, key: key, mods: mods) {
+                writeLine(fd, ["ok": true, "op": "key", "key": k, "via": "menu-item",
+                               "verification": unverified("axpress_unasserted")])
+                return
+            }
+            pressKey(k, route: .pid(app.app.processIdentifier))
+            writeLine(fd, ["ok": true, "op": "key", "key": k, "via": "pid",
+                           "verification": unverified("synthetic_input")])
         }
-        pressKey(k)
-        writeLine(fd, ["ok": true, "op": "key", "key": k])
+
+    case "scroll":
+        guard let ref = req["ref"] as? String else {
+            writeLine(fd, ["ok": false, "reasonCode": "bad_args"]); return
+        }
+        if cache[ref] == nil, let snap = snapshot(appSpec) { cacheStore(snap) }
+        guard let el = cache[ref] else {
+            writeLine(fd, ["ok": false, "reasonCode": "cache_miss"]); return
+        }
+        if let stale = cacheStale(ref) { writeLine(fd, stale); return }
+        let dir = (req["direction"] as? String) ?? "down"
+        let pages = (req["pages"] as? NSNumber)?.doubleValue ?? 1
+        let axAction: String
+        switch dir {
+        case "up": axAction = "AXScrollUpByPage"
+        case "down": axAction = "AXScrollDownByPage"
+        case "left": axAction = "AXScrollLeftByPage"
+        default: axAction = "AXScrollRightByPage"
+        }
+        var cursor: AXUIElement? = el
+        var hops = 0
+        while let c = cursor, hops < 10 {
+            var acts: CFArray?
+            if AXUIElementCopyActionNames(c, &acts) == .success,
+               let list = acts as? [String], list.contains(axAction) {
+                for _ in 0..<max(1, Int(pages.rounded())) {
+                    _ = AXUIElementPerformAction(c, axAction as CFString)
+                }
+                writeLine(fd, ["ok": true, "op": "scroll", "direction": dir, "via": "ax",
+                               "action": axAction, "verification": unverified("axpress_unasserted")])
+                return
+            }
+            var parentRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &parentRef) == .success,
+               let p = parentRef as! AXUIElement? { cursor = p } else { cursor = nil }
+            hops += 1
+        }
+        // 容器没有 AX 滚动动作：定向滚轮，不动光标、不抢焦点
+        guard let app = resolveAppSafe(appSpec), let center = elementCenter(el) else {
+            writeLine(fd, ["ok": false, "reasonCode": "no_geometry"]); return
+        }
+        let dy: Int32 = (dir == "up" ? 1 : -1) * Int32(10 * pages)
+        scrollWheel(at: center, dy: dy, route: .pid(app.app.processIdentifier))
+        var scrollOut: [String: Any] = ["ok": true, "op": "scroll", "direction": dir,
+                                        "via": "pid-wheel",
+                                        "verification": unverified("synthetic_input")]
+        scrollOut.merge(pointPayload(center, space: "screen")) { _, new in new }
+        writeLine(fd, scrollOut)
 
     case "invalidate":
         cache.removeAll(); cacheMeta.removeAll(); cacheApp = ""
@@ -1152,7 +1704,8 @@ func handleClient(_ fd: Int32) {
     }
 }
 
-func serveDaemon(path: String) -> Never {
+/// socket 主循环。跑在后台队列：主线程要留给 NSApplication 的 runloop（HUD）。
+func socketLoop(path: String) -> Never {
     unlink(path)
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { die("socket() failed", code: 20) }
@@ -1178,6 +1731,20 @@ func serveDaemon(path: String) -> Never {
         handleClient(c)
         close(c)
     }
+}
+
+func serveDaemon(path: String) -> Never {
+    // SCU_HUD=0（CI / 无 WindowServer）时保持纯后台，不起 AppKit。
+    guard ProcessInfo.processInfo.environment["SCU_HUD"] != "0" else {
+        socketLoop(path: path)
+    }
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)   // 不占 Dock、不抢焦点
+    DispatchQueue.global(qos: .userInitiated).async {
+        socketLoop(path: path)
+    }
+    app.run()
+    exit(0)
 }
 
 switch cmd {
@@ -1213,7 +1780,7 @@ case "doctor":
     // 常见于显示器休眠 / 长时间无操作。光看第一项会误报"可用"。
     var windowUsable = false
     var windowProbeApp = "-"
-    for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+    for app in liveApps() where app.activationPolicy == .regular {
         let ax = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(ax, 0.8)
         guard let ws = attr(ax, kAXWindowsAttribute) as? [AXUIElement] else { continue }
@@ -1249,10 +1816,11 @@ case "doctor":
 
 case "apps":
     var list: [[String: Any]] = []
-    for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+    for app in liveApps() where app.activationPolicy == .regular {
         let ax = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(ax, 0.6)
-        let ws = (attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []
+        // 只数真窗口：Finder 只有桌面时也会在 AXWindows 里塞代理元素
+        let ws = ((attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []).filter { isWindow($0) }
         let titles = ws.compactMap { asText(attr($0, kAXTitleAttribute)) }
         list.append(["name": app.localizedName ?? "", "bundle": app.bundleIdentifier ?? "",
                      "pid": app.processIdentifier, "windows": ws.count,
@@ -1282,7 +1850,10 @@ case "snapshot":
 case "act":
     guard let appSpec = args.flag("app") else { die("missing --app", code: 4) }
     guard let op = args.flag("op") else { die("missing --op", code: 4) }
-    let wantMouse = args.flag("via") == "mouse"
+    let via = args.flag("via") ?? "ax"
+    let wantMouse = via == "mouse"
+    let wantPid = via == "pid"
+    let space = args.flag("space") ?? "screen"
 
     // ---------- click ----------
     if op == "click" {
@@ -1291,32 +1862,56 @@ case "act":
         // 坐标点击
         if let xs = args.flag("x"), let ys = args.flag("y"),
            let px = Double(xs), let py = Double(ys) {
-            let pt = CGPoint(x: px, y: py)
+            guard let pt = toScreenPoint(CGPoint(x: px, y: py), appSpec: appSpec, space: space) else {
+                emit(["ok": false, "reasonCode": "window_not_found",
+                      "hint": "--space window 需要目标 app 有可读窗口"]); exit(3)
+            }
+            let pointOut = pointPayload(pt, space: space)
+            if wantPid {
+                // 定向投递：不移动真实光标、不抢焦点。
+                mouseClick(at: pt, button: (args.flag("button") == "right") ? .right : .left,
+                           count: args.int("count", 1), route: .pid(app.app.processIdentifier))
+                var r: [String: Any] = ["ok": true, "op": "click", "via": "pid-mouse",
+                                        "verification": unverified("synthetic_input")]
+                r.merge(pointOut) { _, new in new }
+                emit(r)
+                break
+            }
             if wantMouse {
                 requireTakeOver(args, why: "坐标鼠标点击会移动指针")
                 activate(app)
                 mouseClick(at: pt, button: (args.flag("button") == "right") ? .right : .left,
                            count: args.int("count", 1))
-                emit(["ok": true, "op": "click", "via": "mouse", "x": px, "y": py])
+                var r: [String: Any] = ["ok": true, "op": "click", "via": "mouse",
+                                        "verification": unverified("synthetic_input")]
+                r.merge(pointOut) { _, new in new }
+                emit(r)
                 break
             }
             // 默认：命中测试 → 往上找可按祖先 → AXPress。全程不动鼠标、不抢焦点。
             guard let hit = elementAtPoint(app.app.processIdentifier, pt) else {
-                emit(["ok": false, "reasonCode": "no_element_at_point", "x": px, "y": py,
-                      "hint": "该坐标没有可访问元素（可能是 Electron 自绘区域）。"
-                            + "需要真的点像素时用 --via mouse --take-over"])
+                var r: [String: Any] = ["ok": false, "reasonCode": "no_element_at_point",
+                                        "hint": "该坐标没有可访问元素（可能是 Electron 自绘区域）。"
+                                              + "需要真的点像素时用 --via pid（定向投递）"
+                                              + "或 --via mouse --take-over（移动光标）"]
+                r.merge(pointOut) { _, new in new }
+                emit(r)
                 exit(13)
             }
             guard let t = pressable(hit) else {
-                emit(["ok": false, "reasonCode": "no_ax_action_at_point", "x": px, "y": py,
-                      "element": elementSnapshot(hit),
-                      "hint": "命中了元素但没有可执行动作。需要真的点像素时用 --via mouse --take-over"])
+                var r: [String: Any] = ["ok": false, "reasonCode": "no_ax_action_at_point",
+                                        "element": elementSnapshot(hit),
+                                        "hint": "命中了元素但没有可执行动作。需要真的点像素时用 --via pid 或 --via mouse --take-over"]
+                r.merge(pointOut) { _, new in new }
+                emit(r)
                 exit(13)
             }
             let err = AXUIElementPerformAction(t.element, t.action as CFString)
             var r: [String: Any] = ["ok": err == .success, "op": "click", "via": "ax-hit-test",
-                                    "x": px, "y": py, "action": t.action,
+                                    "action": t.action,
+                                    "verification": unverified("axpress_unasserted"),
                                     "element": elementSnapshot(t.element)]
+            r.merge(pointOut) { _, new in new }
             if err != .success { r["reasonCode"] = "ax_action_failed" }
             emit(r)
             if err != .success { exit(14) }
@@ -1351,12 +1946,27 @@ case "act":
             emit(["ok": false, "reasonCode": "disabled", "ref": n.ref]); exit(7)
         }
 
+        // --via pid：定向投递坐标点击，不激活窗口、不移动真实光标
+        if wantPid {
+            guard let p = centerOf(s.nodes, target, keep: s.keep) else {
+                emit(["ok": false, "reasonCode": "no_geometry", "ref": n.ref]); exit(8)
+            }
+            mouseClick(at: p, button: (args.flag("button") == "right") ? .right : .left,
+                       count: args.int("count", 1), route: .pid(s.app.app.processIdentifier))
+            var r: [String: Any] = ["ok": true, "op": "click", "ref": n.ref, "via": "pid-mouse",
+                                    "verification": unverified("synthetic_input")]
+            r.merge(pointPayload(p, space: "screen")) { _, new in new }
+            emit(r)
+            break
+        }
+
         // 默认永远先试 AX；只有显式 --via mouse 才动鼠标
         if !wantMouse {
             // 注意：这里刻意不含 AXShowMenu
             for act in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where n.actions.contains(act) {
                 if AXUIElementPerformAction(s.elems[target], act as CFString) == .success {
-                    emit(["ok": true, "op": "click", "ref": n.ref, "via": "ax", "action": act])
+                    emit(["ok": true, "op": "click", "ref": n.ref, "via": "ax", "action": act,
+                          "verification": unverified("axpress_unasserted")])
                     exit(0)
                 }
             }
@@ -1364,12 +1974,13 @@ case "act":
             if let t = pressable(s.elems[target]) {
                 if AXUIElementPerformAction(t.element, t.action as CFString) == .success {
                     emit(["ok": true, "op": "click", "ref": n.ref, "via": "ax-ancestor",
-                          "action": t.action])
+                          "action": t.action, "verification": unverified("axpress_unasserted")])
                     exit(0)
                 }
             }
             emit(["ok": false, "reasonCode": "no_ax_action", "ref": n.ref, "role": n.role,
-                  "hint": "这个元素没有可执行的无障碍动作。需要真点像素时用 --via mouse --take-over"])
+                  "hint": "这个元素没有可执行的无障碍动作。需要真点像素时用 --via pid（定向投递）"
+                        + "或 --via mouse --take-over（移动光标）"])
             exit(13)
         }
 
@@ -1380,7 +1991,10 @@ case "act":
         activate(s.app)
         mouseClick(at: p, button: (args.flag("button") == "right") ? .right : .left,
                    count: args.int("count", 1))
-        emit(["ok": true, "op": "click", "ref": n.ref, "via": "mouse", "x": p.x, "y": p.y])
+        var r: [String: Any] = ["ok": true, "op": "click", "ref": n.ref, "via": "mouse",
+                                "verification": unverified("synthetic_input")]
+        r.merge(pointPayload(p, space: "screen")) { _, new in new }
+        emit(r)
         break
     }
 
@@ -1393,8 +2007,12 @@ case "act":
             emit(["ok": false, "reasonCode": "stale_ref"]); exit(5)
         }
         guard let v = args.flag("value") else { die("missing --value", code: 4) }
-        let ok = writeText(into: s.elems[i], v)
+        let el = s.elems[i]
+        let before = readBack(el)
+        let ok = setValue(into: el, v)
         emit(["ok": ok, "op": "set", "ref": ref, "via": "ax",
+              "verification": ok ? verifyWrite(el, before: before, expected: v)
+                                 : unverified("set_failed"),
               "reasonCode": ok ? "" : "set_failed"])
         if !ok { exit(14) }
         break
@@ -1417,19 +2035,32 @@ case "act":
                 targetEl = (f as! AXUIElement)
             }
         }
-        if let el = targetEl, writeText(into: el, t) {
-            emit(["ok": true, "op": "type", "via": "ax", "chars": t.count])
+        if let el = targetEl {
+            let before = readBack(el)
+            if insertText(into: el, t) {
+                emit(["ok": true, "op": "type", "via": "ax", "chars": t.count,
+                      "verification": verifyWrite(el, before: before, expected: t)])
+                break
+            }
+        }
+        // AX 写不进去（webview / 自绘控件）：默认定向投递，不抢焦点。
+        // 目标窗口不是 key window 时事件可能被丢弃 —— 用 --wait 或 --take-over 兜。
+        if !wantMouse && !args.has("take-over") {
+            typeText(t, route: .pid(app.app.processIdentifier))
+            emit(["ok": true, "op": "type", "via": "pid", "chars": t.count,
+                  "verification": unverified("synthetic_input")])
             break
         }
-        // AX 写不进去 —— 需要真键盘，必须接管
         requireTakeOver(args, why: "键盘输入需要目标窗口获得焦点")
         activate(app)
         if t.count > 8 && !args.has("no-paste") {
             _ = pasteText(t)
-            emit(["ok": true, "op": "type", "via": "paste", "chars": t.count])
+            emit(["ok": true, "op": "type", "via": "paste", "chars": t.count,
+                  "verification": unverified("clipboard_paste")])
         } else {
             typeText(t)
-            emit(["ok": true, "op": "type", "via": "keyboard", "chars": t.count])
+            emit(["ok": true, "op": "type", "via": "keyboard", "chars": t.count,
+                  "verification": unverified("synthetic_input")])
         }
         break
     }
@@ -1438,21 +2069,27 @@ case "act":
     if op == "key" {
         guard let k = args.flag("key") else { die("missing --key", code: 4) }
         let app = resolveApp(appSpec)
-        if !wantMouse {
+        if !wantMouse && !args.has("take-over") {
             // 先试菜单栏：命中就能在后台触发，不碰焦点
             if let (key, mods) = chordToMenuItem(k), findAndPressMenuItem(app.ax, key: key, mods: mods) {
-                emit(["ok": true, "op": "key", "key": k, "via": "menu-item"])
+                emit(["ok": true, "op": "key", "key": k, "via": "menu-item",
+                      "verification": unverified("axpress_unasserted")])
                 break
             }
-            emit(["ok": false, "reasonCode": "needs_takeover", "key": k,
-                  "hint": "这个组合键不是菜单项，只能靠真键盘发送，需要目标窗口聚焦。"
-                        + "确认要接管时加 --take-over"])
-            exit(11)
+            // 不是菜单项：定向投递，不抢焦点
+            guard parseKey(k) != nil else {
+                emit(["ok": false, "reasonCode": "invalid_key", "key": k]); exit(4)
+            }
+            pressKey(k, route: .pid(app.app.processIdentifier))
+            emit(["ok": true, "op": "key", "key": k, "via": "pid",
+                  "verification": unverified("synthetic_input")])
+            break
         }
         requireTakeOver(args, why: "发送组合键需要目标窗口聚焦")
         activate(app)
         pressKey(k)
-        emit(["ok": true, "op": "key", "key": k, "via": "keyboard"])
+        emit(["ok": true, "op": "key", "key": k, "via": "keyboard",
+              "verification": unverified("synthetic_input")])
         break
     }
 
@@ -1483,7 +2120,8 @@ case "act":
                 for _ in 0..<max(1, Int(pages.rounded())) {
                     _ = AXUIElementPerformAction(c, axAction as CFString)
                 }
-                emit(["ok": true, "op": "scroll", "direction": dir, "via": "ax", "action": axAction])
+                emit(["ok": true, "op": "scroll", "direction": dir, "via": "ax",
+                      "action": axAction, "verification": unverified("axpress_unasserted")])
                 exit(0)
             }
             var parentRef: CFTypeRef?
@@ -1491,17 +2129,26 @@ case "act":
                let p = parentRef as! AXUIElement? { cur = p } else { cur = nil }
             hops += 1
         }
-        requireTakeOver(args, why: "这个容器没有 AX 滚动动作，只能合成滚轮事件")
-        if let p = centerOf(s.nodes, i, keep: s.keep) {
-            activate(s.app)
-            let src = CGEventSource(stateID: .hidSystemState)
-            CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)?
-                .post(tap: .cghidEventTap)
-            let dy: Int32 = (dir == "up" ? 1 : -1) * Int32(10 * pages)
-            CGEvent(scrollWheelEvent2Source: src, units: .line, wheelCount: 1,
-                    wheel1: dy, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
+        guard let p = centerOf(s.nodes, i, keep: s.keep) else {
+            emit(["ok": false, "reasonCode": "no_geometry"]); exit(8)
         }
-        emit(["ok": true, "op": "scroll", "direction": dir, "via": "wheel"])
+        let dy: Int32 = (dir == "up" ? 1 : -1) * Int32(10 * pages)
+        // 没有 AX 滚动动作。默认定向投递滚轮，不抢焦点；--via mouse 才移动光标。
+        if !wantMouse && !args.has("take-over") {
+            scrollWheel(at: p, dy: dy, route: .pid(s.app.app.processIdentifier))
+            var r: [String: Any] = ["ok": true, "op": "scroll", "direction": dir, "via": "pid-wheel",
+                                    "verification": unverified("synthetic_input")]
+            r.merge(pointPayload(p, space: "screen")) { _, new in new }
+            emit(r)
+            break
+        }
+        requireTakeOver(args, why: "这个容器没有 AX 滚动动作，只能合成滚轮事件")
+        activate(s.app)
+        scrollWheel(at: p, dy: dy)
+        var r: [String: Any] = ["ok": true, "op": "scroll", "direction": dir, "via": "wheel",
+                                "verification": unverified("synthetic_input")]
+        r.merge(pointPayload(p, space: "screen")) { _, new in new }
+        emit(r)
         break
     }
 

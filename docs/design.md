@@ -64,7 +64,7 @@
 | AX 遍历（批量读） | Finder ~70 ms / Chrome ~40 ms |
 | Python 启动 + JSON | ~30 ms |
 
-**下一步优化**：常驻 daemon 可以省掉两次进程启动（~60ms），并且能缓存树做增量。预计端到端能进 30ms 内。这一版没做，因为无状态版本更简单、更好调试，而且 100ms 已经比模型层快两个数量级。
+**常驻 daemon 已经做了**：复用活元素缓存 + 可见区过滤，动作命中缓存时是微秒级；CLI 端到端仍有一次进程启动（~60ms），100ms 级已经比模型层快两个数量级。
 
 ---
 
@@ -201,23 +201,39 @@ SkyComputerUseService 导入符号：
 |---|---|---|
 | 元素操作 | `AXUIElementPerformAction`（AXPress/AXOpen/AXConfirm） | 否 |
 | 坐标操作 | `AXUIElementCopyElementAtPosition` → 向上找可按祖先 → AXPress | 否 |
+| 坐标操作（`--via pid`） | `CGEventPostToPid` 定向鼠标事件 | 否 |
 | 文本写入 | `AXUIElementSetAttributeValue`（AXSelectedText / AXValue） | 否 |
-| 滚动 | `AXScrollUpByPage` 等动作 | 否 |
-| 组合键 | 找 `AXMenuItemCmdChar` + `AXMenuItemCmdModifiers` 匹配的菜单项并 AXPress | 否 |
-| 兜底 | `CGEvent` 合成 | **是**，必须显式授权 |
+| 文本写入（`--via pid`） | `CGEventPostToPid` 定向键盘事件 | 否（可能被拒） |
+| 滚动 | `AXScrollUpByPage` 等动作；没有就定向滚轮 | 否 |
+| 组合键 | 找 `AXMenuItemCmdChar` + `AXMenuItemCmdModifiers` 匹配的菜单项并 AXPress；否则定向投递 | 否 |
+| 兜底 | `CGEvent` 系统事件流 | **是**，必须显式授权 |
 
 ### 9.3 实测过的两件事
 
 **① 后台 AXPress 真的能工作。** 飞书不是前台 app，直接对它发 AXPress，
 搜索模态被打开了，鼠标没动、前台 app 没变。
 
-**② `CGEvent.postToPid` 能不动鼠标，但后台 app 不响应。**
+**② `CGEvent.postToPid` 的鼠标事件有效，键盘事件看 app。**
 发给飞书 pid 一个 ⌘K：鼠标位置前后完全一致（说明 `postToPid` 有效），
-但飞书毫无反应 —— 键盘事件必须 app 活跃才生效。
+但飞书毫无反应 —— 键盘事件必须 app 活跃才生效。鼠标事件则被 Finder 后台窗口接收
+（实测点到了窗口内的关闭按钮）。
 
-所以组合键没有纯后台方案，只能走菜单栏，否则必须接管。这是硬约束，不是实现偷懒。
+所以：鼠标 `--via pid` 是可靠的静默路径；键盘 `--via pid` 只能算"尽力投递"，
+结果一律 `unverified(synthetic_input)`。真要保证键盘落地，走菜单项或显式接管。
+这是 app 层的约束，不是 API 的。
 
-### 9.4 一个必须澄清的边界：不抢焦点 ≠ 界面上看不见
+### 9.4 结果契约：ok 与 verification 是两件事
+
+| 字段 | 含义 |
+|---|---|
+| `ok` | 动作被接受并执行（无硬错误）。坐标动作若 AX 返回失败但界面确实变了，也会置 true，原始错误进 `providerError` |
+| `verification.state` | `verified`（有读回证据）/ `unverified`（没有） |
+| `verification.reason` | `value_readback` / `ui_changed`；或 `synthetic_input` / `clipboard_paste` / `value_mismatch` / `value_unchanged` / `axpress_unasserted` / `ui_unchanged` / `provider_unavailable` |
+
+合成输入永远不会因为"界面变了"升级成 verified：变了不等于输入落到了目标控件。
+
+
+### 9.5 一个必须澄清的边界：不抢焦点 ≠ 界面上看不见
 
 `AXPress` 不合成输入事件，但它**执行 app 自己的点击逻辑**。实测：后台对飞书搜索按钮
 发 AXPress，鼠标没动、前台仍是 Chrome，但飞书的搜索模态**弹出来了**（它是浮动窗口，
@@ -235,7 +251,7 @@ Codex 同样如此：它做了截图闪光层、快门音、和 `"Esc to cancel"
 
 这个边界决定了选型顺序：**能走 API 的别走 GUI；GUI 只读安全，GUI 写入必然可见。**
 
-### 9.5 接管的两个门槛
+### 9.6 接管的两个门槛
 
 ```bash
 --take-over                  # 1. 显式授权
@@ -250,18 +266,21 @@ Agent 总能等到空隙。
 
 拒绝时给出可分流的原因：`needs_takeover`(11) / `user_active`(12) / `no_ax_action_at_point`(13)。
 
-## 9. 输入合成
+### 9.7 状态条为什么在 daemon 进程里
 
-| 场景 | 做法 | 副作用 |
-|---|---|---|
-| 控件点击 | `AXPress` | **不动鼠标、不抢焦点**，用户能继续工作 |
-| 普通元素点击 | `CGEvent` 鼠标事件 | 需要窗口在前台，会移动鼠标 |
-| 输入文字 | `CGEvent` 逐字符 unicode | 需要目标已聚焦 |
-| 快捷键 | `CGEvent` + modifier flags | xdotool 风格的 `super+s` |
+屏幕上那条 `scu · click / verified · via ax` 是 daemon 自己开的无边框 NSPanel，
+不是独立 app。三个理由：
 
-优先 AXPress：它对用户打扰最小，而且不依赖窗口层级。
+1. **浮窗不需要 TCC**。显示本身不要任何权限；把窗口搬进独立 .app 不会少一次授权，只会多一次安装。
+2. **独立 .app 的成本在签名/安装/SMAppService**，收益是权限隔离 —— 但 scu 的权限本来就在调用方进程
+   （终端 / agent），helper 拿不拿 AX 权限对这条窗没有任何影响。
+3. **展示不能拖慢调用**：HUD 更新发生在 `writeLine` 之后（响应已写回 socket），完全异步。
 
----
+代价是 daemon 主线程要跑 `NSApplication.run()`，socket accept 循环挪到后台串行队列。
+实测动作耗时不变（`actMs` 2ms，`waitedMs` 45–50ms，与加 HUD 前一致）。
+
+副作用（好的）：daemon 有 runloop 之后，`NSWorkspace` 的 app 列表通知也正常了。
+不过 `sysctl` 兜底仍然保留 —— `SCU_HUD=0` 时 daemon 是纯后台进程，没有 runloop。
 
 ## 10. 截图为什么不走 ScreenCaptureKit
 
@@ -338,8 +357,8 @@ reasonCode 是 `no_accessible_windows`，exit 3。**只看第一项会误报可�
 
 | 没做 | 原因 |
 |---|---|
-| 常驻 daemon | 无状态版本更简单、更好调试。100ms 已经够快。列为下一步（预计进 30ms） |
 | ScreenCaptureKit | 需要 .app 上下文，和"单文件 CLI"的定位冲突 |
+| 独立 helper.app | 权限隔离只在「把工具分发给别人」时才值钱；当前形态（调用方授权 + daemon 展示）已够用 |
 | 多平台 | AX / UIA / AT-SPI 语义差太多，硬套一个抽象是负担 |
 | drag | AX 无法表达拖拽语义，必须坐标。优先级低于精度 |
 | 录制回放 | recipe 已支持静态步骤序列；自动录制需要监听用户操作，成本高 |

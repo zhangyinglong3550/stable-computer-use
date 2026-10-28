@@ -80,9 +80,10 @@ console.log(await app.state());        // 再看一眼
 | `await app.state()` | 紧凑文本树，直接打印 |
 | `await app.click({ref})` | AX 动作，不动鼠标不抢焦点 |
 | `await app.click({x,y})` | 命中测试 → AXPress |
+| `await app.click({x,y,via:"pid"})` | 定向投递，不动光标不抢焦点 |
 | `await app.click({x,y,mouse:true})` | 真鼠标（会激活窗口） |
 | `await app.type("你好")` | 优先 AX 直写 |
-| `await app.key("super+s")` | 菜单项优先，否则真键盘 |
+| `await app.key("super+s")` | 菜单项优先，否则定向投递（`{activate:true}` 才用真键盘） |
 | `await app.set(ref, "v")` | 直接写值 |
 | `await app.shot("/tmp/a.png")` | 截图（配合 `scu shot --crop` 只看一块） |
 | `scu.sleep(ms)` / `scu.log(...)` | 等待 / 输出 |
@@ -117,18 +118,46 @@ EOF
 
 ## 常用命令
 
+daemon 会显示一条浮动状态条（`scu · click` / `verified · via ax`），鼠标穿透、不抢焦点。
+不想要就用 `SCU_HUD=0` 启动 daemon；`SCU_HUD_POS=bottom` 放屏幕底部。
+它只是展示，别把它当成功判据 —— 判据只认 JSON 里的 `verification`。
+
 ```bash
 scu apps                                  # 有哪些 app 有窗口
 scu snapshot --app "Chrome" --json        # 结构化（默认是给人看的文本）
-scu click --app A --ref R [--via ax] [--button right] [--count 2]
-scu type  --app A --text "..."
-scu key   --app A --key "super+s"
+scu click --app A --ref R [--via ax|pid] [--button right] [--count 2]
+scu click --app A --xy 100,50 [--space screen|window] [--via ax|pid|mouse]
+scu type  --app A --text "..."            # AX 直写 → 失败自动定向投递
+scu key   --app A --key "super+s"         # 菜单项 → 定向投递，都默认不抢焦点
 scu scroll --app A --ref R --direction down --pages 2
-scu set   --app A --ref R --value "..."   # 直接写值，比打字快
+scu set   --app A --ref R --value "..."   # 直接写值，比打字快，会读回校验
 scu shot  --app A --out /tmp/a.png        # 窗口截图（兜底用）
 scu recipe list                           # 录过的步骤序列
 scu batch                                 # 从 stdin 读 JSONL，一个进程跑多条（最快）
 ```
+
+### 坐标只有一种话
+
+- `snapshot` 的 `rect` / `windowRect` / `windowOrigin` 都是**屏幕坐标**（左上原点），
+  JSON 顶层 `coordinateSpace: "screen"` 说明这一点。
+- `click --xy` 默认也吃屏幕坐标；传 `--space window` 时是**窗口内坐标**
+  （原点 = 窗口左上角），由工具加窗口原点换算。输出里会回显 `coordinateSpace` 和 `screen`。
+- `scu shot` 输出 `scale` 和 `actionFormula`：图像像素 ÷ scale = 窗口点。
+  不要拿图像像素直接当坐标用。
+
+### 三档投递：ax → pid → mouse
+
+| 档位 | 行为 | 抢焦点/动光标 | 结果可信度 |
+|---|---|---|---|
+| `ax`（默认） | 无障碍动作（Press / SetValue / 滚动动作） | ❌ | `unverified(axpress_unasserted)`，靠 `--wait` 的 `changed` 判断 |
+| `pid` | 定向投递到目标进程（`CGEventPostToPid`） | ❌ | `unverified(synthetic_input)`：app 可能因为没有 key window 丢事件 |
+| `mouse` | 系统级事件流，真移动光标 | ✅ 需要 `--take-over` | `unverified(synthetic_input)` |
+
+**读回校验**：`set` / `type`（走 AX 时）会读回值，返回
+`verification: {state: "verified", source: "value_readback"}`。
+其它形态是 `unverified`，带 `reason`（`synthetic_input` / `clipboard_paste` /
+`value_mismatch` / `value_unchanged` / `axpress_unasserted` / `ui_unchanged`）。
+**`ok: true` 不等于界面真的变了**；别把 `unverified` 当成功上报。
 
 ## 什么时候别用它
 
@@ -144,14 +173,16 @@ scu batch                                 # 从 stdin 读 JSONL，一个进程�
 |---|---|---|
 | `app_not_found` | app 没开或名字不对 | `scu apps` 看真实名字 / bundle id |
 | `no_window` | app 没窗口 | 可能被最小化了，请用户打开 |
-| `stale_ref` | ref 过期 | 重新 snapshot |
+| `stale_ref` | ref 过期（元素被重建/换了窗口，`why` 会说是哪一个） | 重新 snapshot |
+| `window_not_found` | `--space window` 但窗口几何读不到 | 用屏幕坐标重试，或确认窗口还在 |
+| `invalid_key` | 键名/修饰键不认识 | 换标准键名（`Return`、`Escape`、`super+s`） |
 | `disabled` | 元素被禁用 | 先让它可用（比如先勾选某选项） |
 | `text_not_found` | 没有这个文字 | 先 snapshot 看真实文字 |
 | `empty_snapshot` | 这个 app 没暴露 AX 树 | Electron 类 app 常见，改用 `scu shot` + 坐标 |
 | `ax_cannot_complete` | AX 返回 -25204 | **屏幕锁了或不是活动 GUI 会话**。请用户解锁后重试，别硬试 |
 | `no_window` | app 没可用窗口 | 窗口被最小化或在别的 Space，请用户调出来 |
 | `no_accessible_windows` | AX 能读但所有窗口都是代理 | 显示器休眠 / 长时间无操作。请用户唤醒屏幕，别反复重试 |
-| `needs_takeover` | 该动作会打断用户 | **不要绕**。换 AX 路径，或问用户 |
+| `needs_takeover` | 这一步会打断用户（`--via mouse` / 真键盘） | **不要绕**。换 AX 或 `--via pid`，或问用户 |
 | `user_active` | 用户刚在操作 | 等一会儿重试，别抢 |
 
 先跑 `scu doctor`。`accessibility` 为 `true` 但 `accessibilityUsable` 为 `false` 时，工具实际不可用 —— 不要假设能操作。

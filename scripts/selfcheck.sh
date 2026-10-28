@@ -111,12 +111,20 @@ else
   ng "真鼠标没有要求授权（exit=$C）"
 fi
 
-"$SCU" key --app "$APP" --key "super+alt+shift+z" >/dev/null 2>&1
+K=$("$SCU" key --app "$APP" --key "super+alt+shift+z" 2>/dev/null)
+KVIA=$(printf '%s' "$K" | j 'd.get("via")')
+if [ "$KVIA" = "pid" ]; then
+  ok "非菜单组合键定向投递，不抢焦点（via=pid）"
+else
+  ng "组合键没有走定向投递（via=${KVIA:-none}）"
+fi
+
+"$SCU" key --app "$APP" --key "super+alt+shift+z" --via mouse >/dev/null 2>&1
 C=$?
 if [ "$C" -eq 11 ]; then
-  ok "无法后台发送的组合键被拒绝（exit 11）"
+  ok "系统级键盘未授权时被拒绝（exit 11）"
 else
-  ng "组合键没有拦截（exit=$C）"
+  ng "系统级键盘没有要求授权（exit=$C）"
 fi
 
 "$SCU" verify --app "$APP" --ref zzzzzz >/dev/null 2>&1

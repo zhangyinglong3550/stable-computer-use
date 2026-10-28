@@ -143,6 +143,33 @@ class TestExitCodes(unittest.TestCase):
     def test_unknown_reason_is_1(self):
         self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "wat"}), 1)
 
+    def test_new_action_reasons(self):
+        self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "window_not_found"}), 3)
+        self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "invalid_key"}), 4)
+        self.assertEqual(scu.exit_for({"ok": False, "reasonCode": "set_failed"}), 14)
+
+
+class TestCoordinateContract(unittest.TestCase):
+    def setUp(self):
+        self.parser = scu.build_parser()
+
+    def test_space_defaults_to_screen(self):
+        a = self.parser.parse_args(["click", "--app", "X", "--xy", "1,2"])
+        self.assertEqual(a.space, "screen")
+
+    def test_space_accepts_window(self):
+        a = self.parser.parse_args(["click", "--app", "X", "--xy", "1,2", "--space", "window"])
+        self.assertEqual(a.space, "window")
+
+    def test_space_rejects_unknown(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(["click", "--app", "X", "--xy", "1,2", "--space", "pixels"])
+
+    def test_click_via_has_pid_route(self):
+        a = self.parser.parse_args(["click", "--app", "X", "--ref", "abc", "--via", "pid"])
+        self.assertEqual(a.via, "pid")
+
+
 
 class TestMemory(unittest.TestCase):
     def setUp(self):

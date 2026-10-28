@@ -744,7 +744,9 @@ EXIT_CODES = {
     "app_not_found": 2, "no_window": 3, "ax_timeout": 9, "ax_cannot_complete": 10,
     "no_accessible_windows": 3, "needs_takeover": 11, "user_active": 12,
     "no_element_at_point": 13, "no_ax_action_at_point": 13, "no_ax_action": 13,
-    "ax_action_failed": 14, "recipe_not_found": 2, "cache_miss": 5,
+    "ax_action_failed": 14, "set_failed": 14, "recipe_not_found": 2, "cache_miss": 5,
+    "window_not_found": 3, "window_not_focused": 12, "no_cg_window": 3,
+    "invalid_key": 4, "bad_args": 4, "empty_snapshot": 3, "shot_failed": 9,
 }
 
 
@@ -774,10 +776,27 @@ def _act(args, op: str, extra: list[str]) -> int:
         req["text"] = flat["text"]
     if "value" in flat:
         req["value"] = flat["value"]
+    if "key" in flat:
+        req["key"] = flat["key"]
+    if "direction" in flat:
+        req["direction"] = flat["direction"]
+    if "pages" in flat:
+        req["pages"] = float(flat["pages"])
     if "x" in flat and "y" in flat:
         req["x"], req["y"] = float(flat["x"]), float(flat["y"])
         if flat.get("via") == "mouse":
             req["mouse"] = True
+    # 动作坐标空间与投递方式：daemon 需要知道，否则只能猜
+    if flat.get("space"):
+        req["space"] = flat["space"]
+    if flat.get("via"):
+        req["via"] = flat["via"]
+    if flat.get("button"):
+        req["button"] = flat["button"]
+    if flat.get("count"):
+        req["count"] = int(flat["count"])
+    if flat.get("activate"):
+        req["activate"] = True
 
     # --wait：动作 + 等界面变化，一步到位（避免截图确认）
     if flat.get("wait"):
@@ -789,8 +808,9 @@ def _act(args, op: str, extra: list[str]) -> int:
         if fast is not None:
             return out(fast, exit_for(fast))
 
-    fast_only = op in ("click", "set", "type") and not flat.get("via") == "mouse" \
-        and not flat.get("take-over")
+    # key/scroll 也走 daemon：一是省一次进程启动，二是状态条要覆盖所有写动作。
+    fast_only = op in ("click", "set", "type", "key", "scroll") \
+        and flat.get("via") != "mouse" and not flat.get("take-over")
     if fast_only:
         fast = dcall(req)
         if fast is not None:
@@ -816,7 +836,8 @@ def cmd_click(args) -> int:
         extra += ["--text", args.text]
     else:
         die("bad_args", "click 需要 --ref / --text / --xy 三者之一", 4)
-    for k, v in (("via", args.via), ("button", args.button), ("count", args.count)):
+    for k, v in (("via", args.via), ("button", args.button), ("count", args.count),
+                 ("space", args.space)):
         if v:
             extra += [f"--{k}", str(v)]
     if args.wait:
@@ -850,6 +871,8 @@ def cmd_scroll(args) -> int:
     extra = ["--ref", args.ref, "--direction", args.direction]
     if args.pages:
         extra += ["--pages", str(args.pages)]
+    if getattr(args, "via", None):
+        extra += ["--via", args.via]
     if args.take_over:
         extra += ["--take-over", "--idle-seconds", str(args.idle_seconds)]
     return _act(args, "scroll", extra)
@@ -936,7 +959,10 @@ def cmd_shot(args) -> int:
     elements = snap.get("elements") or []
     if not elements:
         die("empty_snapshot", "拿不到窗口", 3)
-    rect = elements[0].get("rect")
+    # 窗口矩形优先用 snapshot 顶层字段（AX 的窗口矩形是权威值）
+    rect = snap.get("windowRect") or elements[0].get("rect")
+    window_origin = snap.get("windowOrigin") or (
+        {"x": rect["x"], "y": rect["y"]} if rect else None)
     pid = snap.get("pid")
     out_path = os.path.abspath(args.out)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -993,9 +1019,14 @@ def cmd_shot(args) -> int:
 
     mode = "window" if win_id is not None else "rect"
     return out({
-        "ok": True, "path": out_path, "rect": rect, "windowId": win_id, "mode": mode,
+        "ok": True, "path": out_path, "rect": rect, "windowRect": rect,
+        "windowOrigin": window_origin, "windowId": win_id, "mode": mode,
         "image": {"w": img_w, "h": img_h}, "scale": scale,
+        "coordinateSpace": "screen",
         "cropOrigin": "window" if mode == "window" else "screen",
+        "actionFormula": (f"action_x = image_px_x / {scale}; "
+                          f"action_y = image_px_y / {scale}; "
+                          "再按 --space screen 传给 click"),
         "hint": (f"图像像素 = 窗口点 × {scale}；--crop 用图像像素，原点在"
                  + ("窗口左上角" if mode == "window" else "屏幕左上角")),
         "bytes": Path(out_path).stat().st_size,
@@ -1151,9 +1182,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--app", required=True)
     c.add_argument("--ref")
     c.add_argument("--text")
-    c.add_argument("--xy", help="屏幕坐标 X,Y（配合 scs shot 使用）")
-    c.add_argument("--via", default="ax", choices=["ax", "mouse"],
-                   help="ax=走无障碍动作（不动鼠标、不抢焦点，默认）；mouse=合成鼠标事件")
+    c.add_argument("--xy", help="X,Y。默认屏幕坐标；--space window 时是窗口内坐标（原点=窗口左上角）")
+    c.add_argument("--space", default="screen", choices=["screen", "window"],
+                   help="--xy 的坐标空间：screen（默认，与 snapshot 的 rect 一致）或 window")
+    c.add_argument("--via", default="ax", choices=["ax", "pid", "mouse"],
+                   help="ax=无障碍动作（默认）；pid=定向投递事件（不动光标、不抢焦点）；"
+                        "mouse=系统级鼠标事件（会移动光标，需要 --take-over）")
     c.add_argument("--button", choices=["left", "right"])
     c.add_argument("--count", type=int)
     c.add_argument("--wait", action="store_true",
@@ -1179,8 +1213,9 @@ def build_parser() -> argparse.ArgumentParser:
     k = sub.add_parser("key")
     k.add_argument("--app", required=True)
     k.add_argument("--key", required=True)
-    k.add_argument("--via", default="ax", choices=["ax", "mouse"],
-                   help="ax=先查菜单栏（后台可触发）；mouse=真键盘，需要接管前台")
+    k.add_argument("--via", default="ax", choices=["ax", "pid", "mouse"],
+                   help="ax=先查菜单栏，再定向投递（默认）；pid=定向投递；"
+                        "mouse=真键盘，需要 --take-over")
     k.add_argument("--wait", action="store_true", help="动作后等界面变化")
     k.add_argument("--wait-timeout", type=int, default=1500)
     k.add_argument("--take-over", action="store_true")
@@ -1192,6 +1227,8 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--ref", required=True)
     sc.add_argument("--direction", default="down", choices=["up", "down", "left", "right"])
     sc.add_argument("--pages", type=float, default=1.0)
+    sc.add_argument("--via", default="ax", choices=["ax", "pid", "mouse"],
+                   help="ax=无障碍滚动动作（默认）；pid=定向投递滚轮；mouse=系统滚轮")
     sc.add_argument("--wait", action="store_true")
     sc.add_argument("--wait-timeout", type=int, default=1500)
     sc.add_argument("--take-over", action="store_true")
