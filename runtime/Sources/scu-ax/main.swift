@@ -1541,6 +1541,7 @@ func handleClient(_ fd: Int32) {
             var out: [String: Any] = ["ok": err == .success, "action": t.action,
                                       "via": "daemon-hit-test",
                                       "verification": unverified("axpress_unasserted")]
+            if err != .success { out["reasonCode"] = "ax_action_failed" }
             out.merge(pointPayload(screen, space: space)) { _, new in new }
             writeLine(fd, out)
         } else {

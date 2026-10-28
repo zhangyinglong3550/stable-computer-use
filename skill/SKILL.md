@@ -75,6 +75,20 @@ console.log(JSON.stringify({ ok: r.ok, failedAt: r.failedAt, ms: r.elapsedMs }))
 返回 `{ok, failedAt, elapsedMs, steps:[{op, ok, ms, changed, verification}]}`。
 `stopOnError: false` 可以不中断地跑完。
 
+### 只看变化：diff
+
+整棵树 260+ 个元素，真正变的常常只有一行。`act()` 默认带 diff，`state({diff:true})` 也只报变化：
+
+```
+# diff +0 -0 ~1
+~ [ogu1g6→1nf6y4] value 你好，这是一段测试文本。 → 改过的内容
+# window: diff-test.txt
+```
+
+- 只报新增 / 消失 / 值变化，每类最多 12 行，超出标 truncated
+- ref 会随 value 变，所以按「角色 + 左上角」配对：打字显示成一次修改，而不是删除+新增
+- `act()` 多两次快照（约 50ms），换掉一次整树观察 —— 通常更划算
+
 ### 发消息：发送前必须确认会话
 
 ```bash

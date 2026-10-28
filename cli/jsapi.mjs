@@ -73,18 +73,141 @@ function renderState(snap) {
   return [head, ...lines, `# ${els.length} elements`].join("\n");
 }
 
+/** 把一次快照压成"ref -> 摘要"，用于 diff。全量树留在 daemon，客户端只存这份。 */
+function summarize(snap) {
+  const elements = new Map();
+  for (const e of snap.elements || []) {
+    elements.set(e.ref, {
+      role: e.role || "",
+      label: e.label || "",
+      value: e.value || "",
+      enabled: e.enabled !== false,
+      // ref 的签名里含 value，值一变 ref 就变 —— 用"角色 + 左上角"配对识别同一个元素
+      anchor: e.rect ? `${e.role}|${Math.round(e.rect.x)}|${Math.round(e.rect.y)}` : `${e.role}|${e.ref}`,
+    });
+  }
+  return { window: snap.window || "", elements };
+}
+
+function clip(s, n = 40) {
+  const t = String(s ?? "").replace(/\s+/g, " ").trim();
+  return t.length > n ? t.slice(0, n) + "…" : t;
+}
+
+function shortRole(role) {
+  return (role || "").replace(/^AX/, "");
+}
+
+/** 只要变化：新增 / 消失 / 值变化。这是"观察"的最小单位。 */
+function diffSummary(prev, next, limit = 12) {
+  if (!prev) {
+    return {
+      first: true, added: next.elements.size, removed: 0, changed: 0,
+      total: next.elements.size, truncated: false, lines: [],
+      windowChanged: null,
+    };
+  }
+  const added = [];
+  const removed = [];
+  const changed = [];
+  for (const [ref, e] of next.elements) {
+    const old = prev.elements.get(ref);
+    if (!old) {
+      added.push({ ref, ...e });
+    } else if (old.label !== e.label || old.value !== e.value || old.enabled !== e.enabled) {
+      changed.push({ ref, before: old, after: e });
+    }
+  }
+  for (const [ref, e] of prev.elements) if (!next.elements.has(ref)) removed.push({ ref, ...e });
+
+  // ref 会随 value 变。把"角色相同、左上角相同"的删+增配对成一次修改，
+  // 否则打字会显示成整块元素被替换，看不出改了什么。
+  const removedByAnchor = new Map();
+  for (const x of removed) {
+    const list = removedByAnchor.get(x.anchor) || [];
+    list.push(x);
+    removedByAnchor.set(x.anchor, list);
+  }
+  const addedLeft = [];
+  for (const x of added) {
+    const bucket = removedByAnchor.get(x.anchor);
+    if (bucket && bucket.length) {
+      const old = bucket.shift();
+      changed.push({ ref: x.ref, oldRef: old.ref, before: old, after: x });
+    } else {
+      addedLeft.push(x);
+    }
+  }
+  const removedLeft = [...removedByAnchor.values()].flat();
+  added.length = 0;
+  removed.length = 0;
+  added.push(...addedLeft);
+  removed.push(...removedLeft);
+
+  const lines = [];
+  for (const x of added.slice(0, limit)) {
+    lines.push(`+ [${x.ref}] ${shortRole(x.role)}${x.label ? ": " + clip(x.label) : ""}`);
+  }
+  for (const x of removed.slice(0, limit)) {
+    lines.push(`- [${x.ref}] ${shortRole(x.role)}${x.label ? ": " + clip(x.label) : ""}`);
+  }
+  for (const x of changed.slice(0, limit)) {
+    const bits = [];
+    if (x.before.label !== x.after.label) {
+      bits.push(`label ${clip(x.before.label, 24) || "∅"} → ${clip(x.after.label, 24) || "∅"}`);
+    }
+    if (x.before.value !== x.after.value) {
+      bits.push(`value ${clip(x.before.value, 24) || "∅"} → ${clip(x.after.value, 24) || "∅"}`);
+    }
+    if (x.before.enabled !== x.after.enabled) {
+      bits.push(`enabled ${x.before.enabled} → ${x.after.enabled}`);
+    }
+    const tag = x.oldRef && x.oldRef !== x.ref ? `[${x.oldRef}→${x.ref}]` : `[${x.ref}]`;
+    lines.push(`~ ${tag} ${bits.join(", ")}`);
+  }
+  const total = added.length + removed.length + changed.length;
+  return {
+    first: false,
+    added: added.length, removed: removed.length, changed: changed.length, total,
+    truncated: total > lines.length,
+    lines,
+    windowChanged: prev.window !== next.window
+      ? { from: prev.window, to: next.window }
+      : null,
+  };
+}
+
+function formatDiff(d, windowTitle) {
+  const head = d.first
+    ? `# 没有基线，这是全量（${d.added} 个元素）`
+    : `# diff +${d.added} -${d.removed} ~${d.changed}${d.windowChanged ? ` | window ${d.windowChanged.from || "∅"} → ${d.windowChanged.to || "∅"}` : ""}`;
+  return [head, ...d.lines, d.first ? "" : `# window: ${windowTitle || ""}`]
+    .filter((x) => x !== "").join("\n");
+}
+
 class App {
   constructor(name) {
     this.name = name;
+    this._lastState = null;
   }
 
-  /** 取状态。默认返回紧凑文本；{json:true} 返回原始结构。 */
+  /**
+   * 取状态。默认返回紧凑文本；{json:true} 返回原始结构。
+   * {diff:true} 只返回相对上次 state/act 的变化 —— 观察成本从"整棵树"降到"几行"。
+   */
   async state(opts = {}) {
     const snap = await rpc({
       cmd: "snapshot", app: this.name, max: opts.max ?? 4000,
       actions: opts.actions !== false,
     });
     if (snap.ok === false) throw new Error(`state failed: ${snap.reasonCode || "unknown"}`);
+    const current = summarize(snap);
+    if (opts.diff) {
+      const d = diffSummary(this._lastState, current);
+      this._lastState = current;
+      return opts.json ? { ...snap, diff: d } : formatDiff(d, snap.window);
+    }
+    this._lastState = current;
     return opts.json ? snap : renderState(snap);
   }
 
@@ -99,20 +222,20 @@ class App {
     const req = { cmd: "click", app: this.name, ...target };
     if (target.space && !req.space) req.space = target.space;
     const r = await rpc(req);
-    if (!r.ok) throw new Error(`click failed: ${r.reasonCode} ${r.hint || ""}`.trim());
+    if (!r.ok) throw new Error(`click failed: ${r.reasonCode || "failed"} ${r.hint || ""}`.trim());
     return r;
   }
 
   async type(text, opts = {}) {
     const r = await rpc({ cmd: "type", app: this.name, text, ...opts });
-    if (!r.ok) throw new Error(`type failed: ${r.reasonCode} ${r.hint || ""}`.trim());
+    if (!r.ok) throw new Error(`type failed: ${r.reasonCode || "failed"} ${r.hint || ""}`.trim());
     return r;
   }
 
   async key(chord, opts = {}) {
     // 默认定向投递（不抢焦点）。需要真键盘时传 { activate: true }。
     const r = await rpc({ cmd: "key", app: this.name, key: chord, ...opts });
-    if (!r.ok) throw new Error(`key failed: ${r.reasonCode} ${r.hint || ""}`.trim());
+    if (!r.ok) throw new Error(`key failed: ${r.reasonCode || "failed"} ${r.hint || ""}`.trim());
     return r;
   }
 
@@ -180,7 +303,9 @@ class App {
     if (!Array.isArray(steps)) throw new Error("act 需要步骤数组");
     const stopOnError = opts.stopOnError !== false;
     const waitMs = opts.waitTimeoutMs ?? 800;
+    const wantDiff = opts.diff !== false;
     const started = Date.now();
+    const before = wantDiff ? summarize(await this._snapshot()) : null;
     const results = [];
     let failedAt = null;
 
@@ -193,14 +318,45 @@ class App {
       } catch (e) {
         r = { ok: false, reasonCode: "js_error", message: e?.message || String(e) };
       }
-      results.push({ index: i, op: step.op, ms: Date.now() - t0, ...r });
+      // 只留报告需要的字段：整份 daemon 响应会把上下文撑爆
+      const slim = { index: i, op: step.op, ms: Date.now() - t0, ok: r.ok === true };
+      if (r.via) slim.via = r.via;
+      if (r.action) slim.action = r.action;
+      if (r.changed !== undefined) slim.changed = r.changed;
+      if (r.verification) {
+        slim.verification = r.verification.state === "verified"
+          ? "verified"
+          : `unverified${r.verification.reason ? `(${r.verification.reason})` : ""}`;
+      }
+      if (r.ok !== true) slim.reasonCode = r.reasonCode || "unknown";
+      results.push(slim);
       if (stopOnError && r.ok === false) {
         failedAt = i;
         break;
       }
     }
 
-    return { ok: failedAt === null, failedAt, elapsedMs: Date.now() - started, steps: results };
+    let diff = null;
+    if (wantDiff) {
+      const after = summarize(await this._snapshot());
+      diff = diffSummary(before, after);
+      this._lastState = after;
+    }
+
+    return {
+      ok: failedAt === null,
+      failedAt,
+      elapsedMs: Date.now() - started,
+      diff,
+      steps: results,
+    };
+  }
+
+  /** 内部：拿一次原始快照。 */
+  async _snapshot() {
+    const snap = await rpc({ cmd: "snapshot", app: this.name, max: 4000, actions: true });
+    if (snap.ok === false) throw new Error(`snapshot failed: ${snap.reasonCode || "unknown"}`);
+    return snap;
   }
 
   async _step(step, waitMs) {

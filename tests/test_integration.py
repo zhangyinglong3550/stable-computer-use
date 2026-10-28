@@ -383,6 +383,22 @@ class TestCodeMode(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn('"ok":true', out.replace(" ", ""))
 
+    def test_act_reports_diff(self):
+        """act 的报告里带 diff，且基线来自动作前，不是 first。"""
+        d, _ = run("snapshot", "--app", APP, "--json")
+        title = d.get("window") or ""
+        if not title:
+            self.skipTest("窗口没有标题")
+        out, err, code = self._js(
+            f'const a = await scu.getApp("{APP}");\n'
+            f'const r = await a.act([{{op:"expect",window:{json.dumps(title)},timeoutMs:1500}}]);\n'
+            'console.log(JSON.stringify({ok:r.ok,'
+            ' diff:r.diff && {first:r.diff.first, added:r.diff.added, changed:r.diff.changed}}));')
+        self.assertEqual(code, 0, err)
+        compact = out.replace(" ", "")
+        self.assertIn('"diff":{', compact)
+        self.assertIn('"first":false', compact)
+
     def test_act_stops_on_first_error(self):
         """失败即停：第二步不该被执行。"""
         out, err, code = self._js(

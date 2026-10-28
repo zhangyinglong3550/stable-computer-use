@@ -140,6 +140,19 @@ if (!r.ok) throw new Error(`第 ${r.failedAt} 步失败`);
 省的不是本地执行——两边都是百毫秒级——而是**每个动作一次模型往返 + 一次观察**。
 `expect` 替代 `sleep`，`changed`/`verification` 直接进报告，不用再单独截图确认。
 
+### 只看变化
+
+`act()` 默认带 diff；`state({diff:true})` 也只报增/删/改：
+
+```
+# diff +0 -0 ~1
+~ [ogu1g6→1nf6y4] value 你好，这是一段测试文本。 → 改过的内容
+# window: diff-test.txt
+```
+
+整棵树 260+ 元素，真正变的往往一行。ref 会随 `value` 变，diff 用「角色 + 左上角」配对，
+所以打字显示为一次修改，不会变成“删一个、加一个”。
+
 ## 为什么是它：三个可验证的点
 
 ### 1. 快照快到不值得优化
@@ -459,7 +472,7 @@ docs/design.md               设计取舍与实测数据
 | 层 | 文件 | 需要权限 | 说明 |
 |---|---|---|---|
 | 单元 | `tests/test_unit.py` | ❌ | 31 条，覆盖文本清洗、打分器（含"预筛绝不返空"回归）、置信度、记忆、exit code、坐标空间参数契约 |
-| 集成 | `tests/test_integration.py` | ✅ | 29 条，真读 AX：ref 唯一性与跨快照稳定性、坐标契约（`windowRect`/`coordinateSpace`）、零宽字符清洗、target_ref 可解析、verify、pid 投递契约、`act` 批量与失败即停、decide 各层、记忆闭环、截图换算公式 |
+| 集成 | `tests/test_integration.py` | ✅ | 30 条，真读 AX：ref 唯一性与跨快照稳定性、坐标契约（`windowRect`/`coordinateSpace`）、零宽字符清洗、target_ref 可解析、verify、pid 投递契约、`act` 批量与失败即停、decide 各层、记忆闭环、截图换算公式 |
 
 集成测试在 AX 不可用（没授权 / 锁屏 / 显示器休眠）时**整体跳过而不是失败**，所以 CI 里也不会红。
 
