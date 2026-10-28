@@ -107,6 +107,33 @@ if (!r.ok) throw new Error("第 " + r.failedAt + " 步失败");
 
 点错会话的代价是发给别人，**不能只靠 `verification` 兜底**：发送前一定要 `expect` 会话标题。
 
+### 已验证的片段
+
+写多行文本（Sublime 这类没有 AX 树、只能定向键盘的编辑器也能跑）：
+
+```js
+const app = await scu.getApp("Sublime Text");
+const lines = ["空山新雨后，天气晚来秋。", "明月松间照，清泉石上流。"];
+const steps = [{ op: "key", key: "super+n" }];
+lines.forEach((text, i) => {
+  if (i) steps.push({ op: "key", key: "Return" });
+  steps.push({ op: "type", text });
+});
+// 没有 AX 树的编辑器，界面签名不会变，等满默认 800ms 是浪费
+const r = await app.act(steps, { waitTimeoutMs: 150 });
+if (!r.ok) throw new Error(`第 ${r.failedAt} 步失败：${r.steps[r.failedAt].reasonCode}`);
+```
+
+切视图并验证（Finder 侧栏这种纯文字节点，`click` 会自动退化成坐标命中）：
+
+```js
+const f = await scu.getApp("Finder");
+const r = await f.act([
+  { op: "click", text: "下载" },
+  { op: "expect", window: "下载", timeoutMs: 2000 },
+]);
+```
+
 ### 单条 CLI 只用于探索
 
 `scu snapshot` / `scu click` 一条条发，只在第一次摸不清界面时用。
