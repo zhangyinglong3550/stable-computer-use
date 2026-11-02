@@ -360,7 +360,10 @@ scu snapshot --app Finder                   # AX 树，带稳定 ref
 scu snapshot --app Finder --json            # 同上，结构化
 
 scu click --app Finder --ref 3netay         # 按 ref 点击（推荐）
-scu click --app Finder --text "搜索"        # 按名字点击
+# 后台服务在线时 scu click --text 不会按文字点击：服务端 click 不认 text，返回 bad_args。
+# 按文字点击用 JS act：{ op: "click", text: "搜索" }。
+# daemon 连不上，或不带 --wait 且加了 --via mouse / --take-over 时，才走一次性进程，那时 --text 会按文字点。
+# 带 --wait 且服务在线时，text 进入 actAndWait，被当成往焦点元素输入，仍然不是按文字点击。
 scu click --app Finder --ref R --via ax     # 走 AXPress，不动鼠标、不抢焦点
 scu type  --app TextEdit --text "hello"
 scu key   --app Finder --key "super+n"
