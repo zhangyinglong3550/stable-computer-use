@@ -80,8 +80,42 @@ def find_ax_binary() -> Path:
 
 
 # ---------------------------------------------------------------- 输出约定
+#
+# SCU_TRACE=1 时，daemon / 一次性进程把分段耗时放在返回值的 trace 数组里。
+# 这里剥掉再写到本进程 stderr，stdout 的结果契约保持不变（里面没有 trace）。
+# 未设置 SCU_TRACE 时只删除字段，不写 stderr。
+
+_trace_seq = 0
+
+
+def trace_enabled() -> bool:
+    return os.environ.get("SCU_TRACE") == "1"
+
+
+def _emit_trace_event(ev: dict) -> None:
+    """一行 JSON 写到本进程 stderr。事件自己没带 step 时用进程内序号补上。"""
+    global _trace_seq
+    line = dict(ev)
+    if "step" not in line:
+        line["step"] = _trace_seq
+        _trace_seq += 1
+    sys.stderr.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+
+def peel_trace(payload: dict) -> dict:
+    """去掉内部 trace。调用方拿到的对象和剥掉之前相比，只少 trace 这一个字段。"""
+    if not isinstance(payload, dict) or "trace" not in payload:
+        return payload
+    trace = payload.pop("trace")
+    if trace_enabled() and isinstance(trace, list):
+        for ev in trace:
+            if isinstance(ev, dict):
+                _emit_trace_event(ev)
+    return payload
+
 
 def out(payload: dict, code: int = 0) -> int:
+    payload = peel_trace(payload)
     payload.setdefault("version", VERSION)
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return code
@@ -153,13 +187,17 @@ def ensure_daemon() -> bool:
 
 
 def dcall(req: dict, timeout: float = 30.0) -> dict | None:
-    """优先走 daemon；不可用则返回 None 让调用方退化。"""
+    """优先走 daemon；不可用则返回 None 让调用方退化。
+
+    socket 返回里的 trace 在这里剥掉。daemon 的 stderr 已经被
+    ensure_daemon 丢进 /dev/null，分段耗时只能走这条返回值。
+    """
     r = _sock_call(req, timeout)
-    if r is not None:
-        return r
-    if ensure_daemon():
-        return _sock_call(req, timeout)
-    return None
+    if r is None and ensure_daemon():
+        r = _sock_call(req, timeout)
+    if r is None:
+        return None
+    return peel_trace(r)
 
 
 # ---------------------------------------------------------------- 调 Swift 助手
@@ -186,7 +224,9 @@ def run_ax(argv: list[str], timeout: float = 30.0) -> dict:
     except json.JSONDecodeError:
         die("ax_bad_json", raw[:300], 1)
     payload.setdefault("elapsedMs", elapsed)
-    return payload
+    # 一次性进程的 JSON 若带 trace，在交给调用方之前剥掉。
+    # cmd_do 会把整份结果嵌进 acted，不能留到 out() 那一层才处理。
+    return peel_trace(payload)
 
 
 def _reason_from_exit(code: int) -> str:

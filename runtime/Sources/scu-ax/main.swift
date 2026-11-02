@@ -1270,12 +1270,126 @@ func signature(_ s: Snapshot) -> String {
     return base36(h, width: 12)
 }
 
+// MARK: - SCU_TRACE
+//
+// 一步 = 调用方的一次 actAndWait（JS 的一步会再把前后快照折进来）。
+// 只在 SCU_TRACE=1 时把分段挂到返回值的 `trace` 数组，不写 daemon stderr
+// （ensure_daemon 把 stderr 丢进 /dev/null）。未设置时返回值不出现 trace。
+//
+// 打点都在这一层，不进 readNode / attr：单个属性读本身就是 IPC，打点会变成主要耗时。
+//   resolve — 函数入口到开始投递：wait_before 轻量快照、解析 app/坐标、
+//             cache miss 时补的快照、elementAtPoint / pressable
+//   deliver — cachedPress、AXPerform、mouseClick、insertText / typeText、pressKey
+//   wait    — 轮询界面变化（含轮询快照）。没进入这个循环就没有 wait_exit
+//   verify  — readBack / verifyWrite，以及末尾的 combineVerification
+//
+// 时钟用 ContinuousClock（单调）。原有 actMs / waitedMs 仍用 Date，语义不变。
+// 一次性进程的 `act` 子命令是另一套实现，不在这里拆阶段。
+
+let scuTraceEnabled: Bool = ProcessInfo.processInfo.environment["SCU_TRACE"] == "1"
+
+func traceElapsedMs(_ start: ContinuousClock.Instant, _ end: ContinuousClock.Instant) -> Int {
+    let c = start.duration(to: end).components
+    let ms = c.seconds * 1000 + (c.attoseconds + 500_000_000_000_000) / 1_000_000_000_000_000
+    if ms > Int64(Int.max) { return Int.max }
+    if ms < 0 { return 0 }
+    return Int(ms)
+}
+
+func traceAction(_ req: [String: Any]) -> String {
+    // 与下面的分支顺序一致：有 ref 就当点击，即使请求里同时带了 text。
+    if req["ref"] as? String != nil { return "click" }
+    if req["x"] != nil && req["y"] != nil { return "click" }
+    if req["text"] as? String != nil { return "type" }
+    if req["key"] as? String != nil { return "key" }
+    return "act"
+}
+
+func traceTier(_ via: String) -> String {
+    switch via {
+    case "mouse", "daemon-mouse", "keyboard":
+        return "mouse"
+    case "pid", "pid-mouse", "pid-wheel":
+        return "pid"
+    default:
+        return "ax"
+    }
+}
+
+final class StepTrace {
+    let enabled: Bool
+    private let clock = ContinuousClock()
+    private var cursor: ContinuousClock.Instant
+    private let t0: ContinuousClock.Instant
+    var resolveMs = 0
+    var deliverMs = 0
+    var waitMs = 0
+    var verifyMs = 0
+    var snapshots = 0
+    var action = "act"
+    var tier = "ax"
+    var waitExit: String? = nil
+
+    init() {
+        enabled = scuTraceEnabled
+        let now = clock.now
+        t0 = now
+        cursor = now
+    }
+
+    /// 把「上次 take 到现在」收成毫秒，并把游标拨到现在。未开 trace 时直接 0。
+    func take() -> Int {
+        guard enabled else { return 0 }
+        let now = clock.now
+        let ms = traceElapsedMs(cursor, now)
+        cursor = now
+        return ms
+    }
+
+    func adoptVia(_ result: [String: Any]) {
+        if let via = result["via"] as? String {
+            tier = traceTier(via)
+        }
+    }
+
+    func finish(_ out: [String: Any]) -> [String: Any] {
+        guard enabled else { return out }
+        var ev: [String: Any] = [
+            "action": action,
+            "tier": tier,
+            "resolve_ms": resolveMs,
+            "deliver_ms": deliverMs,
+            "wait_ms": waitMs,
+            "verify_ms": verifyMs,
+            "total_ms": traceElapsedMs(t0, clock.now),
+            "snapshots": snapshots,
+        ]
+        if let waitExit {
+            ev["wait_exit"] = waitExit
+        }
+        var copy = out
+        copy["trace"] = [ev]
+        return copy
+    }
+}
+
 /// 执行一个动作，然后轮询直到界面变化（或超时）。
 /// 这是替代"动作后截图给模型看"的关键原语：一次遍历 30–120ms，比一次视觉判断快一个数量级。
 func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [String: Any] {
-    // 轮询只需要"变没变"，不需要动作列表 —— 省掉一半 IPC
-    guard let before = snapshot(appSpec, withActions: false) else {
-        return ["ok": false, "reasonCode": "no_window", "app": appSpec]
+    let tr = StepTrace()
+    tr.action = traceAction(req)
+
+    func snap(actions: Bool = true) -> Snapshot? {
+        // 只数这一次调用里的快照，不进 collect 的每个节点。
+        if tr.enabled { tr.snapshots += 1 }
+        return snapshot(appSpec, withActions: actions)
+    }
+
+    // 轮询只需要"变没变"，不需要动作列表 —— 省掉一半 IPC。
+    // 这是 wait_before：原来的 actMs 不含它，trace 的 resolve_ms 含它。
+    guard let before = snap(actions: false) else {
+        tr.resolveMs += tr.take()
+        return tr.finish(["ok": false, "reasonCode": "no_window", "app": appSpec])
     }
     // 注意：这里**不** cacheStore —— 轻量快照没有动作列表，覆盖缓存会让后续点击失效
     let sigBefore = signature(before)
@@ -1283,60 +1397,83 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     let wantActivate = (req["activate"] as? Bool) == true
     let route: EventRoute = resolveAppSafe(appSpec)
         .map { .pid($0.app.processIdentifier) } ?? .global
+    tr.resolveMs += tr.take()
 
     // ---- 执行 ----
+    // actMs 的起点保持在 wait_before 之后，和改 trace 之前一致。
     let tActStart = Date()
     var actResult: [String: Any] = ["ok": true]
     if let ref = req["ref"] as? String {
         actResult = cachedPress(ref)
+        tr.deliverMs += tr.take()
         if (actResult["reasonCode"] as? String) == "cache_miss" {
-            if let fresh = snapshot(appSpec) { cacheStore(fresh) }
+            if let fresh = snap() { cacheStore(fresh) }
+            tr.resolveMs += tr.take()
             actResult = cachedPress(ref)
+            tr.deliverMs += tr.take()
         }
         if (actResult["reasonCode"] as? String) == "cache_miss" {
             actResult = ["ok": false, "reasonCode": "stale_ref", "ref": ref]
         }
-        // 动作本身失败了就别再等界面变化
-        if (actResult["ok"] as? Bool) != true { return actResult }
+        tr.adoptVia(actResult)
+        // 动作本身失败了就别再等界面变化。没进入等待，wait_exit 留空，不当超时。
+        if (actResult["ok"] as? Bool) != true { return tr.finish(actResult) }
     } else if let x = req["x"] as? Double, let y = req["y"] as? Double {
         guard let app = resolveAppSafe(appSpec) else {
-            return ["ok": false, "reasonCode": "app_not_found"]
+            tr.resolveMs += tr.take()
+            return tr.finish(["ok": false, "reasonCode": "app_not_found"])
         }
         guard let screen = toScreenPoint(CGPoint(x: x, y: y), appSpec: appSpec, space: space) else {
-            return ["ok": false, "reasonCode": "window_not_found"]
+            tr.resolveMs += tr.take()
+            return tr.finish(["ok": false, "reasonCode": "window_not_found"])
         }
         let mouseButton: CGMouseButton = (req["button"] as? String) == "right" ? .right : .left
         let count = (req["count"] as? Int) ?? 1
         if (req["mouse"] as? Bool) == true || (req["via"] as? String) == "mouse" {
+            tr.resolveMs += tr.take()
             if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
                 activate(app)
             }
             mouseClick(at: screen, button: mouseButton, count: count)
+            tr.deliverMs += tr.take()
             actResult = ["ok": true, "via": "mouse", "verification": unverified("synthetic_input")]
         } else if (req["via"] as? String) == "pid" {
+            tr.resolveMs += tr.take()
             mouseClick(at: screen, button: mouseButton, count: count,
                        route: .pid(app.app.processIdentifier))
+            tr.deliverMs += tr.take()
             actResult = ["ok": true, "via": "pid-mouse", "verification": unverified("synthetic_input")]
         } else {
             guard let hit = elementAtPoint(app.app.processIdentifier, screen),
                   let t = pressable(hit) else {
-                return ["ok": false, "reasonCode": "no_ax_action_at_point"]
+                tr.resolveMs += tr.take()
+                return tr.finish(["ok": false, "reasonCode": "no_ax_action_at_point"])
             }
+            tr.resolveMs += tr.take()
             let err = AXUIElementPerformAction(t.element, t.action as CFString)
+            tr.deliverMs += tr.take()
             actResult = ["ok": err == .success, "via": "hit-test", "action": t.action,
                          "verification": unverified("axpress_unasserted")]
             if err != .success { actResult["reasonCode"] = "ax_action_failed" }
         }
         actResult.merge(pointPayload(screen, space: space)) { _, new in new }
+        tr.adoptVia(actResult)
     } else if let text = req["text"] as? String {
         guard let app = resolveAppSafe(appSpec) else {
-            return ["ok": false, "reasonCode": "app_not_found"]
+            tr.resolveMs += tr.take()
+            return tr.finish(["ok": false, "reasonCode": "app_not_found"])
         }
         var targetEl: AXUIElement?
         if let ref = req["ref"] as? String {
-            if cache[ref] == nil, let fresh = snapshot(appSpec) { cacheStore(fresh) }
-            if let stale = cacheStale(ref) { return stale }
-            guard cache[ref] != nil else { return ["ok": false, "reasonCode": "stale_ref", "ref": ref] }
+            if cache[ref] == nil, let fresh = snap() { cacheStore(fresh) }
+            if let stale = cacheStale(ref) {
+                tr.resolveMs += tr.take()
+                return tr.finish(stale)
+            }
+            guard cache[ref] != nil else {
+                tr.resolveMs += tr.take()
+                return tr.finish(["ok": false, "reasonCode": "stale_ref", "ref": ref])
+            }
             targetEl = cache[ref]
         } else {
             var f: CFTypeRef?
@@ -1344,28 +1481,38 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
                 targetEl = (f as! AXUIElement)
             }
         }
+        tr.resolveMs += tr.take()
         var wrote = false
         if let el = targetEl {
             let previous = readBack(el)
+            tr.verifyMs += tr.take()
             if insertText(into: el, text) {
+                tr.deliverMs += tr.take()
                 wrote = true
+                let verification = verifyWrite(el, before: previous, expected: text)
+                tr.verifyMs += tr.take()
                 actResult = ["ok": true, "via": "ax",
-                             "verification": verifyWrite(el, before: previous, expected: text)]
+                             "verification": verification]
             }
         }
         if !wrote {
             // AX 写不进去（webview / 自绘控件）：定向投递键盘，不抢焦点。
             typeText(text, route: route)
+            tr.deliverMs += tr.take()
             actResult = ["ok": true, "via": route.label == "pid" ? "pid" : "keyboard",
                          "verification": unverified("synthetic_input")]
         }
+        tr.adoptVia(actResult)
     } else if let k = req["key"] as? String {
         guard parseKey(k) != nil else {
-            return ["ok": false, "reasonCode": "invalid_key", "key": k]
+            tr.resolveMs += tr.take()
+            return tr.finish(["ok": false, "reasonCode": "invalid_key", "key": k])
         }
         guard let app = resolveAppSafe(appSpec) else {
-            return ["ok": false, "reasonCode": "app_not_found"]
+            tr.resolveMs += tr.take()
+            return tr.finish(["ok": false, "reasonCode": "app_not_found"])
         }
+        tr.resolveMs += tr.take()
         if wantActivate,
            NSWorkspace.shared.frontmostApplication?.processIdentifier != app.app.processIdentifier {
             activate(app)
@@ -1377,11 +1524,16 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
             pressKey(k, route: .pid(app.app.processIdentifier))
             actResult = ["ok": true, "via": "pid", "verification": unverified("synthetic_input")]
         }
+        tr.deliverMs += tr.take()
+        tr.adoptVia(actResult)
     } else {
-        return ["ok": false, "reasonCode": "bad_args"]
+        tr.resolveMs += tr.take()
+        return tr.finish(["ok": false, "reasonCode": "bad_args"])
     }
 
     // ---- 等变化 ----
+    // 动作分支里还没归类的缝隙算进 deliver，避免漏进 wait。
+    tr.deliverMs += tr.take()
     let actMs = Int(Date().timeIntervalSince(tActStart) * 1000)
     let started = Date()
     var changed = false
@@ -1389,12 +1541,15 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     while waited < timeoutMs {
         usleep(45_000)
         waited = Int(Date().timeIntervalSince(started) * 1000)
-        guard let now = snapshot(appSpec, withActions: false) else { continue }
+        guard let now = snap(actions: false) else { continue }
         if signature(now) != sigBefore {
             changed = true
             break
         }
     }
+    tr.waitMs += tr.take()
+    // 走到这里说明有超时概念：时间用尽仍未变化才是 timeout。更早的失败已经 return 了。
+    tr.waitExit = changed ? "changed" : "timeout"
 
     var out = actResult
     out["changed"] = changed
@@ -1409,9 +1564,11 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
         out["ok"] = true
     }
     out["verification"] = combineVerification(out["verification"] as? [String: Any], changed: changed)
+    tr.verifyMs += tr.take()
     if !changed { out["note"] = "界面没有变化：动作可能没生效，或者这个动作本来就不改界面" }
-    return out
+    return tr.finish(out)
 }
+
 
 /// 合成输入的 unverified 不能因为"界面变了"就升级成 verified ——
 /// 变了不等于这串字落到了你以为的那个输入框。
@@ -1849,6 +2006,8 @@ case "snapshot":
     }
 
 case "act":
+    // 分段耗时打在 daemon 的 actAndWait（ContinuousClock）。
+    // 这条一次性 `act` 是另一套实现，JS 基线不走这里，不在这条路径上拆阶段。
     guard let appSpec = args.flag("app") else { die("missing --app", code: 4) }
     guard let op = args.flag("op") else { die("missing --op", code: 4) }
     let via = args.flag("via") ?? "ax"
