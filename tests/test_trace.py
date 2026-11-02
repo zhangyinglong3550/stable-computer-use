@@ -16,6 +16,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCU = ROOT / "cli" / "scu"
@@ -275,6 +276,24 @@ class TestWechatScenarioOptIn(unittest.TestCase):
         self.assertIn("bad_args", src)
         self.assertIn("visibleOnly", src)
 
+    def test_wechat_without_confirm_send_does_not_spawn(self):
+        old = {key: os.environ.pop(key, None) for key in ("SCU_WECHAT_SESSION", "SCU_WECHAT_TEXT")}
+        try:
+            with mock.patch.object(bench.subprocess, "run") as run:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = bench.main(["--scenario", "wechat"])
+            self.assertNotEqual(code, 0)
+            run.assert_not_called()
+            self.assertEqual(
+                buf.getvalue().strip(),
+                "将向 文件传输助手 发送 你好 共 5 次，加 --confirm-send 才会执行",
+            )
+        finally:
+            for key, value in old.items():
+                if value is not None:
+                    os.environ[key] = value
+
 
 class TestJsPureFunctions(unittest.TestCase):
     def test_find_target_peel_and_compose(self):
@@ -287,6 +306,7 @@ import { pathToFileURL } from "node:url";
 import {
   findTargetMatch, peelTrace, composeStepTrace, fallbackFromActResult,
   attributeWaitPoll, attributeFindSnapshot, countTextHits, cliEntryMatches,
+  hitTargetLabel,
 } from "./cli/jsapi.mjs";
 
 const first = findTargetMatch([
@@ -380,6 +400,21 @@ const hits = countTextHits([
   { label: "其他", value: "在吗" },
 ], "你好");
 if (hits !== 2) throw new Error("count " + hits);
+
+const named = hitTargetLabel([
+  { label: "其他", value: "" },
+  { label: "文件传输助手", value: "别的" },
+  { label: "稍后的文件传输助手", value: "" },
+], "文件");
+if (named !== "文件传输助手") throw new Error("first hit label " + named);
+const fromValue = hitTargetLabel([{ label: "  ", value: "你好" }], "你好");
+if (fromValue !== "你好") throw new Error("value fallback " + fromValue);
+if (hitTargetLabel([{ label: "其他" }], "没有") !== null) throw new Error("miss should be null");
+
+const traced = composeStepTrace({ step: 0, action: "click", totalMs: 3, target: "文件传输助手" });
+if (traced.target !== "文件传输助手") throw new Error("target missing");
+const plain = composeStepTrace({ step: 0, action: "click", totalMs: 3 });
+if ("target" in plain) throw new Error("target leaked onto a step with no hit");
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scu-cli-"));
 try {

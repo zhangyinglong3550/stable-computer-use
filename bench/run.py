@@ -136,11 +136,20 @@ def _fmt_ms(v) -> str:
     return f"{v:.1f}"
 
 
-def _print_wechat(report: dict, runs: list[dict]) -> None:
+def wechat_payload() -> tuple[str, str]:
+    """和 WECHAT_JS 用同一对环境变量，避免提示和实际发送的不是同一段文字。"""
+    session = os.environ.get("SCU_WECHAT_SESSION") or "文件传输助手"
+    text = os.environ.get("SCU_WECHAT_TEXT") or "你好"
+    return session, text
+
+
+def _print_wechat(report: dict, runs: list[dict], session: str, text: str) -> None:
     n = report["runs"]
     ok = report["successes"]
     rate = report["success_rate"]
-    print(f"### 微信基线（文件传输助手 · 你好） n={n}\n")
+    print(f"发送对象：{session}")
+    print(f"文字：{text}")
+    print(f"### 微信基线（{session} · {text}） n={n}\n")
     print("前置：微信已登录，主窗口可见，「文件传输助手」在可见列表里"
           "（snapshot 默认 visibleOnly）。bundle id 是 `com.tencent.xinWeChat`。")
     print("daemon 若在没设 `SCU_TRACE` 时已经在跑，分段里的 daemon 部分会退回"
@@ -185,11 +194,12 @@ def _print_wechat(report: dict, runs: list[dict]) -> None:
     print()
 
 
-def scenario_wechat() -> int:
+def scenario_wechat(confirm_send: bool = False) -> int:
     """在微信里打开「文件传输助手」并发「你好」，跑 5 次。
 
-    会真的发出消息，只能通过 `--scenario wechat` 显式触发。默认
-    `python3 bench/run.py` 不会进这里。
+    会真的发出消息。必须同时带 `--scenario wechat` 和 `--confirm-send`。
+    不带 `--confirm-send` 只打印将要发送的对象和文字，退出码非 0，不启动子进程。
+    默认 `python3 bench/run.py` 不会进这里。
 
     前置条件（Mac）：
     - 微信已登录，主窗口可见
@@ -210,6 +220,12 @@ def scenario_wechat() -> int:
     发出去之后不等「出现你好」（历史消息会误判），等可见节点里含这段文字的
     个数比发送前多。snapshot 默认 visibleOnly，虚拟滚动出去的行不在个数里。
     """
+    session, text = wechat_payload()
+    if not confirm_send:
+        print(f"将向 {session} 发送 {text} 共 {WECHAT_RUNS} 次，加 --confirm-send 才会执行")
+        return 2
+    print(f"发送对象：{session}")
+    print(f"文字：{text}")
     stats = _load_trace_stats()
     runs: list[dict] = []
     for _ in range(WECHAT_RUNS):
@@ -244,7 +260,7 @@ def scenario_wechat() -> int:
             "reason": reason,
         })
     report = stats.summarize_runs(runs, expected=WECHAT_RUNS)
-    _print_wechat(report, runs)
+    _print_wechat(report, runs, session, text)
     return 0
 
 
@@ -313,7 +329,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--scenario",
         choices=["wechat"],
         default=None,
-        help="显式基线场景。wechat 会在微信里真的发送消息，默认跑法不会执行",
+        help="显式基线场景。wechat 会在微信里真的发送消息，还要再加 --confirm-send",
+    )
+    ap.add_argument(
+        "--confirm-send",
+        action="store_true",
+        help="和 --scenario wechat 一起用才会真的发送；不带则只打印对象和文字",
     )
     return ap
 
@@ -322,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     # 微信场景会真的发消息，和延迟/准确率默认跑法分开。
     if args.scenario == "wechat":
-        return scenario_wechat()
+        return scenario_wechat(confirm_send=args.confirm_send)
 
     apps = args.app or ["com.apple.finder", "com.google.Chrome", "com.electron.lark"]
     if not args.accuracy_only:

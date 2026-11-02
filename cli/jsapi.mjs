@@ -159,6 +159,8 @@ export function composeStepTrace(input) {
     snapshots,
   };
   if (waitExit) line.wait_exit = waitExit;
+  // 文字点击命中的节点名。只出现在 trace 行上，不进 stdout 结果。
+  if (typeof input.target === "string" && input.target) line.target = input.target;
   return line;
 }
 
@@ -193,13 +195,30 @@ export function countTextHits(elements, text) {
   return n;
 }
 
+function firstTextHit(elements, text) {
+  return (elements || []).find((e) =>
+    `${e.label || ""} ${e.value || ""}`.includes(text)) || null;
+}
+
+/**
+ * 第一个包含这段文字的节点的名字。优先 label，没有 label 时用 value。
+ * 没命中、或两个字段都空，返回 null（trace 不写 target）。
+ */
+export function hitTargetLabel(elements, text) {
+  const hit = firstTextHit(elements, text);
+  if (!hit) return null;
+  const label = typeof hit.label === "string" ? hit.label.trim() : "";
+  if (label) return label;
+  const value = typeof hit.value === "string" ? hit.value.trim() : "";
+  return value || null;
+}
+
 /**
  * 第一次子串命中。有 actions 用 ref（优先 target_ref）；没有则用 rect 中心，
  * 让 daemon 往上找可点祖先。没有可用矩形时退回 ref。
  */
 export function findTargetMatch(elements, text) {
-  const hit = (elements || []).find((e) =>
-    `${e.label || ""} ${e.value || ""}`.includes(text));
+  const hit = firstTextHit(elements, text);
   if (!hit) return null;
   if (hit.actions?.length) return { ref: hit.target_ref || hit.ref };
   if (hit.rect && hit.rect.w > 0 && hit.rect.h > 0) {
@@ -530,7 +549,9 @@ class App {
       const held = [];
       const prevHold = traceHold;
       if (traceOn) {
-        this._traceAcc = { resolveMs: 0, deliverMs: 0, waitMs: 0, snapshots: 0, waitExit: null };
+        this._traceAcc = {
+          resolveMs: 0, deliverMs: 0, waitMs: 0, snapshots: 0, waitExit: null, target: null,
+        };
         traceHold = held;
       }
       const t0 = monoNs();
@@ -568,6 +589,7 @@ class App {
           jsWaitMs: acc?.waitMs || 0,
           jsSnapshots: acc?.snapshots || 0,
           waitExit: acc?.waitExit || null,
+          target: acc?.target || null,
           // 没有 daemon 片段时才用 actMs/waitedMs 兜底，避免和 JS 侧计时叠在一起。
           fallback: held.length ? null : fallbackFromActResult(r),
           extraResolveMs: 0,
@@ -722,6 +744,9 @@ class App {
     const found = attributeFindSnapshot(nsToMs(monoNs() - t));
     this._noteResolve(found.resolveMs, found.snapshots);
     if (snap.ok === false) return null;
+    // 只在 SCU_TRACE=1（_traceAcc 存在）时记下命中节点的名字，不放进动作结果。
+    const label = hitTargetLabel(snap.elements, text);
+    if (label && this._traceAcc) this._traceAcc.target = label;
     return findTargetMatch(snap.elements, text);
   }
 
