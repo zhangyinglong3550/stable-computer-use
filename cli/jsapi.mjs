@@ -22,9 +22,9 @@
  *   await scu.activate("Finder")
  */
 
+import fs from "node:fs";
 import net from "node:net";
-import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SOCK = process.env.SCU_SOCK || `/tmp/scu-${process.getuid()}.sock`;
 const TIMEOUT = Number(process.env.SCU_JS_TIMEOUT || 30000);
@@ -160,6 +160,37 @@ export function composeStepTrace(input) {
   };
   if (waitExit) line.wait_exit = waitExit;
   return line;
+}
+
+/**
+ * waitFor 一轮轮询的归属：快照和 sleep 都算 wait，不算 resolve。
+ * snapshots 仍加 1（这一轮有一次快照）。sleepMs 省略时只计快照。
+ */
+export function attributeWaitPoll(snapshotMs, sleepMs = 0) {
+  return {
+    resolveMs: 0,
+    waitMs: (Number(snapshotMs) || 0) + (Number(sleepMs) || 0),
+    snapshots: 1,
+  };
+}
+
+/** _findTarget 的那次快照算 resolve，不算 wait。 */
+export function attributeFindSnapshot(snapshotMs) {
+  return {
+    resolveMs: Number(snapshotMs) || 0,
+    waitMs: 0,
+    snapshots: 1,
+  };
+}
+
+/** label/value 里含 text 的可见元素个数。空 text 不算命中。 */
+export function countTextHits(elements, text) {
+  if (!text) return 0;
+  let n = 0;
+  for (const e of elements || []) {
+    if (`${e.label || ""} ${e.value || ""}`.includes(text)) n += 1;
+  }
+  return n;
 }
 
 /**
@@ -463,9 +494,10 @@ class App {
     this._traceAcc.deliverMs += ms;
   }
 
-  _noteWait(ms) {
+  _noteWait(ms, snaps = 0) {
     if (!this._traceAcc) return;
     this._traceAcc.waitMs += ms;
+    this._traceAcc.snapshots += snaps;
   }
 
   _noteWaitExit(v) {
@@ -479,6 +511,7 @@ class App {
     const waitMs = opts.waitTimeoutMs ?? 800;
     const wantDiff = opts.diff !== false;
     const traceOn = traceEnabled();
+    const indexBase = Number.isInteger(opts.indexBase) && opts.indexBase >= 0 ? opts.indexBase : 0;
     const started = monoNs();
     // diff_before：act 开头那次快照。归到第一步的 resolve_ms，让多出来的快照可见。
     let diffBeforeMs = 0;
@@ -513,7 +546,8 @@ class App {
       const acc = this._traceAcc;
       this._traceAcc = null;
       // 只留报告需要的字段：整份 daemon 响应会把上下文撑爆
-      const slim = { index: i, op: step.op, ms: Math.round(stepMs), ok: r.ok === true };
+      const index = indexBase + i;
+      const slim = { index, op: step.op, ms: Math.round(stepMs), ok: r.ok === true };
       if (r.via) slim.via = r.via;
       if (r.action) slim.action = r.action;
       if (r.changed !== undefined) slim.changed = r.changed;
@@ -526,7 +560,7 @@ class App {
       results.push(slim);
       if (traceOn) {
         built.push({
-          step: i,
+          step: index,
           action: step.op || "unknown",
           daemonEvents: held,
           jsResolveMs: acc?.resolveMs || 0,
@@ -642,10 +676,25 @@ class App {
       }
       case "expect": {
         const timeout = step.timeoutMs ?? 3000;
-        const hit = step.window
-          ? await this.waitFor((_, snap) => (snap.window || "").includes(step.window), { timeoutMs: timeout })
-          : await this._waitForText(step.text, timeout, step.absent === true);
-        const what = step.window ? `window=${step.window}` : `text=${step.text}`;
+        let hit;
+        let what;
+        if (typeof step.countGreaterThan === "number") {
+          const n0 = step.countGreaterThan;
+          hit = await this.waitFor(
+            (elements) => countTextHits(elements, step.text) > n0,
+            { timeoutMs: timeout },
+          );
+          what = `text=${step.text} count>${n0}`;
+        } else if (step.window) {
+          hit = await this.waitFor(
+            (_, snap) => (snap.window || "").includes(step.window),
+            { timeoutMs: timeout },
+          );
+          what = `window=${step.window}`;
+        } else {
+          hit = await this._waitForText(step.text, timeout, step.absent === true);
+          what = `text=${step.text}`;
+        }
         return hit
           ? { ok: true, verification: { state: "verified", source: "expect " + what } }
           : { ok: false, reasonCode: "expect_timeout", expect: what };
@@ -669,8 +718,9 @@ class App {
   async _findTarget(text) {
     const t = monoNs();
     const snap = await rpc({ cmd: "snapshot", app: this.name, max: 4000, actions: true });
-    // 失败也算一次快照：IPC 已经发生了。
-    this._noteResolve(nsToMs(monoNs() - t), 1);
+    // 失败也算一次快照：IPC 已经发生了。找目标算 resolve，不算 wait。
+    const found = attributeFindSnapshot(nsToMs(monoNs() - t));
+    this._noteResolve(found.resolveMs, found.snapshots);
     if (snap.ok === false) return null;
     return findTargetMatch(snap.elements, text);
   }
@@ -691,14 +741,18 @@ class App {
     while (monoNs() < deadline) {
       const tSnap = monoNs();
       const snap = await rpc({ cmd: "snapshot", app: this.name, max: 4000, actions: false });
-      this._noteResolve(nsToMs(monoNs() - tSnap), 1);
+      const snapMs = nsToMs(monoNs() - tSnap);
       if (snap.ok !== false && fn(snap.elements || [], snap)) {
+        // 命中这一轮没有 sleep，快照本身仍算 wait。
+        const part = attributeWaitPoll(snapMs, 0);
+        this._noteWait(part.waitMs, part.snapshots);
         this._noteWaitExit("changed");
         return true;
       }
       const tSleep = monoNs();
       await new Promise((r) => setTimeout(r, 80));
-      this._noteWait(nsToMs(monoNs() - tSleep));
+      const part = attributeWaitPoll(snapMs, nsToMs(monoNs() - tSleep));
+      this._noteWait(part.waitMs, part.snapshots);
     }
     this._noteWaitExit("timeout");
     return false;
@@ -742,6 +796,7 @@ export const scu = {
   },
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   log: (...a) => console.log(...a),
+  countTextHits,
   get rpcCount() {
     return rpcCount;
   },
@@ -766,14 +821,18 @@ async function main() {
   }
 }
 
-function runningAsCli() {
-  const entry = process.argv[1];
+/** argv 入口和本模块是不是同一个文件。两边都 realpath，避免符号链接把直接 node 启动判成非 CLI。 */
+export function cliEntryMatches(entry, moduleUrl = import.meta.url) {
   if (!entry) return false;
   try {
-    return import.meta.url === pathToFileURL(path.resolve(entry)).href;
+    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(moduleUrl));
   } catch {
     return false;
   }
+}
+
+function runningAsCli() {
+  return cliEntryMatches(process.argv[1]);
 }
 
 if (runningAsCli()) {

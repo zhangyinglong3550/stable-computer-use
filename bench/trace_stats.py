@@ -73,8 +73,10 @@ def summarize_runs(runs: list[dict], *, expected: int = 5) -> dict:
     elapsed = [run["elapsed_ms"] for run in runs if isinstance(run.get("elapsed_ms"), (int, float))]
     wall = [run["wall_ms"] for run in runs if isinstance(run.get("wall_ms"), (int, float))]
 
+    phase_names = ("resolve_ms", "deliver_ms", "wait_ms", "verify_ms")
     order: list[tuple] = []
     totals: dict[tuple, list[float]] = {}
+    phases: dict[tuple, dict[str, list[float]]] = {}
     present: dict[tuple, int] = {}
     timeout_hits: dict[tuple, int] = {}
     timeout_denom: dict[tuple, int] = {}
@@ -87,12 +89,16 @@ def summarize_runs(runs: list[dict], *, expected: int = 5) -> dict:
             if key not in present:
                 order.append(key)
                 totals[key] = []
+                phases[key] = {name: [] for name in phase_names}
                 present[key] = 0
                 timeout_hits[key] = 0
                 timeout_denom[key] = 0
             present[key] += 1
             if isinstance(ev.get("total_ms"), (int, float)):
                 totals[key].append(float(ev["total_ms"]))
+            for name in phase_names:
+                if isinstance(ev.get(name), (int, float)):
+                    phases[key][name].append(float(ev[name]))
             exit_ = ev.get("wait_exit")
             if exit_ in ("changed", "timeout"):
                 timeout_denom[key] += 1
@@ -103,6 +109,7 @@ def summarize_runs(runs: list[dict], *, expected: int = 5) -> dict:
     for key in order:
         vals = totals[key]
         n = present[key]
+        phase = phases[key]
         steps.append({
             "step": key[0],
             "action": key[1],
@@ -111,6 +118,10 @@ def summarize_runs(runs: list[dict], *, expected: int = 5) -> dict:
             "label": f"{n}/{expected}",
             "median_ms": _median(vals),
             "mean_ms": _mean(vals),
+            "median_resolve_ms": _median(phase["resolve_ms"]),
+            "median_deliver_ms": _median(phase["deliver_ms"]),
+            "median_wait_ms": _median(phase["wait_ms"]),
+            "median_verify_ms": _median(phase["verify_ms"]),
         })
 
     timeouts = []

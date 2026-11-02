@@ -60,6 +60,13 @@ WECHAT_RUNS = 5
 
 # 走 JS app.act，不走 `scu click --text`。
 # daemon 在线时 click 不认 text，会返回 bad_args。这是已知问题，本场景不修。
+#
+# 最后一步不能是 `expect text:"你好"`：第 2 轮起会话里已经有历史「你好」，
+# 一出现就会通过。改成打开会话后、打字和回车之前数一次可见节点个数 n0，
+# 发出去之后等个数 > n0。可见列表有虚拟滚动，滚出屏幕的行不在树里，
+# 所以看个数增加，不看「字符串是否出现」。
+# 两段 act 拼成一份报告；第二段用 indexBase 接着编号，最后一步是
+# expect countGreaterThan，这样 trace 仍按 0..4 对齐。
 WECHAT_JS = r"""
 const session = process.env.SCU_WECHAT_SESSION || "文件传输助手";
 const text = process.env.SCU_WECHAT_TEXT || "你好";
@@ -70,20 +77,56 @@ const bundle = process.env.SCU_WECHAT_BUNDLE || "com.tencent.xinWeChat";
 //   SCU_WECHAT_EXPECT_TITLE=实际看到的标题（默认跟会话名一样）
 const expectKind = process.env.SCU_WECHAT_EXPECT || "window";
 const expectTitle = process.env.SCU_WECHAT_EXPECT_TITLE || session;
-const steps = [{ op: "click", text: session }];
-if (expectKind === "text") {
-  steps.push({ op: "expect", text: expectTitle, timeoutMs: 3000 });
-} else {
-  steps.push({ op: "expect", window: expectTitle, timeoutMs: 3000 });
+const t0 = process.hrtime.bigint();
+
+function finish(report) {
+  report.elapsedMs = Math.round(Number(process.hrtime.bigint() - t0) / 1e6);
+  console.log(JSON.stringify(report));
 }
-steps.push(
-  { op: "type", text },
-  { op: "key", key: "Return" },
-  { op: "expect", text, timeoutMs: 3000 },
-);
+
+const openSteps = [{ op: "click", text: session }];
+if (expectKind === "text") {
+  openSteps.push({ op: "expect", text: expectTitle, timeoutMs: 3000 });
+} else {
+  openSteps.push({ op: "expect", window: expectTitle, timeoutMs: 3000 });
+}
+
 const app = await scu.getApp(bundle);
-const r = await app.act(steps);
-console.log(JSON.stringify(r));
+const opened = await app.act(openSteps);
+if (!opened.ok) {
+  finish(opened);
+} else {
+  let n0 = null;
+  let snapErr = null;
+  try {
+    const snap = await app.state({ json: true, actions: false });
+    n0 = scu.countTextHits(snap.elements, text);
+  } catch (e) {
+    snapErr = e?.message || String(e);
+  }
+  if (snapErr) {
+    finish({
+      ok: false,
+      failedAt: opened.steps.length,
+      reasonCode: "snapshot_failed",
+      detail: snapErr,
+      steps: opened.steps,
+    });
+  } else {
+    const sent = await app.act([
+      { op: "type", text },
+      { op: "key", key: "Return" },
+      { op: "expect", text, countGreaterThan: n0, timeoutMs: 3000 },
+    ], { indexBase: opened.steps.length });
+    finish({
+      ok: sent.ok === true,
+      failedAt: sent.ok ? null : opened.steps.length + sent.failedAt,
+      diff: sent.diff,
+      n0,
+      steps: opened.steps.concat(sent.steps),
+    });
+  }
+}
 """
 
 
@@ -109,11 +152,13 @@ def _print_wechat(report: dict, runs: list[dict]) -> None:
     print(f"- 脚本 elapsedMs：min {_fmt_ms(el['min'])} / 中位数 {_fmt_ms(el['median'])} / max {_fmt_ms(el['max'])}")
     print(f"- bench 墙钟：min {_fmt_ms(wall['min'])} / 中位数 {_fmt_ms(wall['median'])} / max {_fmt_ms(wall['max'])}")
     print()
-    print("| step | op | n | median ms | mean ms |")
-    print("|---|---|---|---|---|")
+    print("| step | op | n | total median | total mean | resolve | deliver | wait | verify |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for st in report["steps"]:
         print(f"| {st['step']} | {st['action']} | {st['label']} | "
-              f"{_fmt_ms(st['median_ms'])} | {_fmt_ms(st['mean_ms'])} |")
+              f"{_fmt_ms(st['median_ms'])} | {_fmt_ms(st['mean_ms'])} | "
+              f"{_fmt_ms(st['median_resolve_ms'])} | {_fmt_ms(st['median_deliver_ms'])} | "
+              f"{_fmt_ms(st['median_wait_ms'])} | {_fmt_ms(st['median_verify_ms'])} |")
     print()
     print("超时命中率（分母只含有 `wait_exit` 的步骤；`timeout` = 时间用尽。"
           "按 step + op 分开，两个 expect 不合并）：")
@@ -161,6 +206,9 @@ def scenario_wechat() -> int:
     默认仍按 SKILL 写成 expect window，需要先看一次快照再定。用
     `SCU_WECHAT_EXPECT=text` 改成在树里找这段文字，用
     `SCU_WECHAT_EXPECT_TITLE` 改成快照里实际的标题。
+
+    发出去之后不等「出现你好」（历史消息会误判），等可见节点里含这段文字的
+    个数比发送前多。snapshot 默认 visibleOnly，虚拟滚动出去的行不在个数里。
     """
     stats = _load_trace_stats()
     runs: list[dict] = []

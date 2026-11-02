@@ -196,6 +196,36 @@ class TestSummarize(unittest.TestCase):
         self.assertEqual(by_step[(1, "expect")]["denom"], 4)
         self.assertEqual(by_step[(4, "expect")]["hits"], 1)
         self.assertEqual(by_step[(4, "expect")]["denom"], 4)
+        # 夹具里每步的分段都是常数，中位数就该是这些常数，而不是 total。
+        self.assertEqual(click["median_resolve_ms"], 1)
+        self.assertEqual(click["median_deliver_ms"], 1)
+        self.assertEqual(click["median_wait_ms"], 1)
+        self.assertEqual(click["median_verify_ms"], 0)
+
+    def test_phase_medians_are_separate_from_total(self):
+        specs = [
+            (10, 1, 10, 0, 4),
+            (20, 3, 10, 0, 4),
+            (30, 5, 10, 0, 4),
+            (40, 7, 10, 0, 4),
+            (50, 9, 100, 8, None),
+        ]
+        runs = []
+        for total, resolve, deliver, wait, verify in specs:
+            ev = {
+                "step": 0, "action": "click", "total_ms": total,
+                "resolve_ms": resolve, "deliver_ms": deliver, "wait_ms": wait,
+            }
+            if verify is not None:
+                ev["verify_ms"] = verify
+            runs.append(_run(True, 1, 1, [ev]))
+        st = stats.summarize_runs(runs, expected=5)["steps"][0]
+        self.assertEqual(st["label"], "5/5")
+        self.assertEqual(st["median_ms"], 30)
+        self.assertEqual(st["median_resolve_ms"], 5)
+        self.assertEqual(st["median_deliver_ms"], 10)
+        self.assertEqual(st["median_wait_ms"], 0)
+        self.assertEqual(st["median_verify_ms"], 4)
 
     def test_text_not_found_is_outside_timeout_denominator(self):
         runs = [{
@@ -237,6 +267,10 @@ class TestWechatScenarioOptIn(unittest.TestCase):
         self.assertNotIn("WeWorkMac", bench.WECHAT_JS)
         self.assertIn("app.act", bench.WECHAT_JS)
         self.assertIn('op: "expect"', bench.WECHAT_JS)
+        self.assertIn("countGreaterThan", bench.WECHAT_JS)
+        self.assertIn("countTextHits", bench.WECHAT_JS)
+        self.assertIn("indexBase", bench.WECHAT_JS)
+        self.assertNotIn('{ op: "expect", text, timeoutMs: 3000 }', bench.WECHAT_JS)
         src = Path(bench.__file__).read_text()
         self.assertIn("bad_args", src)
         self.assertIn("visibleOnly", src)
@@ -246,7 +280,14 @@ class TestJsPureFunctions(unittest.TestCase):
     def test_find_target_peel_and_compose(self):
         node = "node"
         script = r"""
-import { findTargetMatch, peelTrace, composeStepTrace, fallbackFromActResult } from "./cli/jsapi.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import {
+  findTargetMatch, peelTrace, composeStepTrace, fallbackFromActResult,
+  attributeWaitPoll, attributeFindSnapshot, countTextHits, cliEntryMatches,
+} from "./cli/jsapi.mjs";
 
 const first = findTargetMatch([
   { ref: "a", label: "其他", actions: ["AXPress"], rect: { x: 0, y: 0, w: 10, h: 10 } },
@@ -318,6 +359,42 @@ const timedOut = composeStepTrace({
 if (timedOut.wait_exit !== "timeout") throw new Error("wait timeout");
 if (timedOut.wait_ms !== 800 || timedOut.deliver_ms !== 5 || timedOut.tier !== "pid") {
   throw new Error("fallback " + JSON.stringify(timedOut));
+}
+
+const poll = attributeWaitPoll(12, 80);
+if (poll.resolveMs !== 0 || poll.waitMs !== 92 || poll.snapshots !== 1) {
+  throw new Error("wait poll must count snapshot and sleep as wait: " + JSON.stringify(poll));
+}
+const hit = attributeWaitPoll(12, 0);
+if (hit.resolveMs !== 0 || hit.waitMs !== 12 || hit.snapshots !== 1) {
+  throw new Error("hit poll snapshot is still wait: " + JSON.stringify(hit));
+}
+const found = attributeFindSnapshot(9);
+if (found.resolveMs !== 9 || found.waitMs !== 0 || found.snapshots !== 1) {
+  throw new Error("find snapshot is resolve: " + JSON.stringify(found));
+}
+
+const hits = countTextHits([
+  { label: "你好", value: "" },
+  { label: "历史", value: "你好" },
+  { label: "其他", value: "在吗" },
+], "你好");
+if (hits !== 2) throw new Error("count " + hits);
+
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scu-cli-"));
+try {
+  const real = path.join(dir, "jsapi.mjs");
+  const link = path.join(dir, "link.mjs");
+  fs.writeFileSync(real, "");
+  fs.symlinkSync(real, link);
+  const moduleUrl = pathToFileURL(real).href;
+  if (!cliEntryMatches(link, moduleUrl)) throw new Error("symlink entry should match real module");
+  if (!cliEntryMatches(real, moduleUrl)) throw new Error("real entry should match");
+  if (pathToFileURL(path.resolve(link)).href === moduleUrl) {
+    throw new Error("path.resolve of the symlink unexpectedly equals the real url");
+  }
+} finally {
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 console.log("ok");
