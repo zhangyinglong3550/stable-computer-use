@@ -1,6 +1,7 @@
 import Cocoa
 import ApplicationServices
 import Foundation
+import os
 
 // MARK: - 常量
 
@@ -1238,7 +1239,94 @@ func cachedPress(_ ref: String) -> [String: Any] {
     return ["ok": false, "reasonCode": "no_ax_action", "ref": ref]
 }
 
+// MARK: - 取消
+//
+// daemon 常驻。一个 run 里的取消标记会粘住，直到下一次 begin_run 清掉，
+// 不能漏到下一次 scu js。置位只有 requestCancel()：cancel 命令现在调它，
+// T3 的 Esc 监听在本进程里也调它（可能在别的线程），所以状态用锁。
+//
+// 写操作在找目标之前走 guardNotCancelled()，命中就直接返回、不执行。
+// 只读命令不查。投递已经发生才计入 completedSteps。
+// actAndWait 的等待是只读轮询：发现已取消就停，这一步仍算完成，也不再白等超时。
+
+struct RunState: Sendable {
+    var cancelled = false
+    var runId = 0
+    var completedSteps = 0
+}
+
+final class RunCancel {
+    private let state = OSAllocatedUnfairLock(initialState: RunState())
+
+    func beginRun() -> [String: Any] {
+        state.withLock { s -> [String: Any] in
+            s.cancelled = false
+            s.completedSteps = 0
+            s.runId += 1
+            return ["ok": true, "runId": s.runId, "completedSteps": 0]
+        }
+    }
+
+    /// 置位。不改 completedSteps，不换 runId。
+    func markCancelled() {
+        state.withLock { s in
+            s.cancelled = true
+        }
+    }
+
+    func isCancelled() -> Bool {
+        state.withLock { $0.cancelled }
+    }
+
+    /// 投递已经发生。等待阶段被取消时这一步也算完成。
+    func noteDelivered() {
+        state.withLock { s in
+            s.completedSteps += 1
+        }
+    }
+
+    func cancelledResponse() -> [String: Any] {
+        state.withLock { s -> [String: Any] in
+            [
+                "ok": false,
+                "status": "cancelled",
+                "completedSteps": s.completedSteps,
+            ]
+        }
+    }
+
+    /// 已取消则返回要直接回给调用方的结果；否则 nil，调用方继续找目标。
+    func guardNotCancelled() -> [String: Any]? {
+        state.withLock { s -> [String: Any]? in
+            guard s.cancelled else { return nil }
+            return [
+                "ok": false,
+                "status": "cancelled",
+                "completedSteps": s.completedSteps,
+            ]
+        }
+    }
+}
+
+let runCancel = RunCancel()
+
+/// cancel 命令和以后的 Esc 监听都调这个函数。
+@discardableResult
+func requestCancel() -> [String: Any] {
+    runCancel.markCancelled()
+    return runCancel.cancelledResponse()
+}
+
+/// handleClient 串行。click/set/type/key/scroll/paste 的成功响应在 writeLine 里记一笔已投递。
+/// actAndWait 自己在进入等待前记账（等待中取消也要算完成），不走这个开关。
+var countWriteDelivery = false
+
 func writeLine(_ fd: Int32, _ obj: [String: Any]) {
+    if countWriteDelivery,
+       (obj["ok"] as? Bool) == true,
+       (obj["status"] as? String) != "cancelled" {
+        runCancel.noteDelivered()
+    }
     if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) {
         var payload = data
         payload.append(0x0A)
@@ -1534,13 +1622,31 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     // ---- 等变化 ----
     // 动作分支里还没归类的缝隙算进 deliver，避免漏进 wait。
     tr.deliverMs += tr.take()
+    // 只有投递成功才计入。失败的 AX 动作如果后来因界面变化被升级成 ok，
+    // 在函数末尾补记一次，避免和 JS 侧“ok 才算 daemon 写步”对不上。
+    var countedDelivery = false
+    if (actResult["ok"] as? Bool) == true {
+        runCancel.noteDelivered()
+        countedDelivery = true
+    }
+    // 取消落在只读轮询里：不再睡满 timeout。已投递的这一步保持计入。
+    // 不走 tr.finish，避免打出带 wait_exit 的 trace 行（汇总会把它当成 timeout）。
+    if runCancel.isCancelled() {
+        return runCancel.cancelledResponse()
+    }
     let actMs = Int(Date().timeIntervalSince(tActStart) * 1000)
     let started = Date()
     var changed = false
     var waited = 0
     while waited < timeoutMs {
+        if runCancel.isCancelled() {
+            return runCancel.cancelledResponse()
+        }
         usleep(45_000)
         waited = Int(Date().timeIntervalSince(started) * 1000)
+        if runCancel.isCancelled() {
+            return runCancel.cancelledResponse()
+        }
         guard let now = snap(actions: false) else { continue }
         if signature(now) != sigBefore {
             changed = true
@@ -1566,6 +1672,9 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     out["verification"] = combineVerification(out["verification"] as? [String: Any], changed: changed)
     tr.verifyMs += tr.take()
     if !changed { out["note"] = "界面没有变化：动作可能没生效，或者这个动作本来就不改界面" }
+    if !countedDelivery, (out["ok"] as? Bool) == true {
+        runCancel.noteDelivered()
+    }
     return tr.finish(out)
 }
 
@@ -1600,6 +1709,17 @@ func handleClient(_ fd: Int32) {
     let cmd = req["cmd"] as? String ?? ""
     let appSpec = req["app"] as? String ?? ""
 
+    // 写操作在找目标之前查一次。已取消就直接返回，不快照、不投递。
+    // snapshot / ping / signature 等只读命令不在这张表里。
+    let writeDeliveryCmds: Set<String> = ["click", "set", "type", "key", "scroll", "paste"]
+    let guardedCmds = writeDeliveryCmds.union(["act", "actAndWait"])
+    if guardedCmds.contains(cmd), let denied = runCancel.guardNotCancelled() {
+        writeLine(fd, denied)
+        return
+    }
+    countWriteDelivery = writeDeliveryCmds.contains(cmd)
+    defer { countWriteDelivery = false }
+
     // 只有写动作上 HUD；snapshot/ping 之类不弹，否则屏幕会一直闪。
     let hudWorthy = ["click", "set", "type", "key", "scroll", "actAndWait"].contains(cmd)
     hudCommand = hudWorthy ? cmd : nil
@@ -1610,6 +1730,14 @@ func handleClient(_ fd: Int32) {
     switch cmd {
     case "ping":
         writeLine(fd, ["ok": true, "pid": getpid(), "cached": cache.count, "app": cacheApp])
+
+    case "begin_run":
+        // 新 run：清标记、换 runId、已完成步数归零。scu js 进程启动时调一次。
+        writeLine(fd, runCancel.beginRun())
+
+    case "cancel":
+        // 置位后，同一 runId 内后续写操作都走 guardNotCancelled。
+        writeLine(fd, requestCancel())
 
     case "snapshot":
         let maxN = req["max"] as? Int ?? 4000

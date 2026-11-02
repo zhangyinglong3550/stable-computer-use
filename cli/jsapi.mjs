@@ -214,6 +214,211 @@ export function hitTargetLabel(elements, text) {
 }
 
 /**
+ * 会改界面的 daemon 命令。snapshot / state / ping / signature 不在里面。
+ * state 在 JS 里就是 snapshot，所以只读调用不会被取消粘性拦住。
+ */
+export function isWriteCmd(cmd) {
+  return cmd === "act" || cmd === "actAndWait" || cmd === "type" || cmd === "key"
+    || cmd === "click" || cmd === "paste" || cmd === "set" || cmd === "scroll";
+}
+
+/**
+ * 一个 run 的取消状态。不连接 daemon，测试可以直接 new。
+ *
+ * completedSteps 的一步 = act 数组里的一个操作，或一次单独的 actAndWait。
+ * 和 trace 的 step 是同一个口径。indexBase 接着上一轮的 completedSteps 续号时，
+ * 下一条 trace 的 step 就等于当前 completedSteps。
+ *
+ * seenDaemon 只跟踪 daemon 已投递的写命令次数，用来判断
+ * “这次取消发生在投递之后的等待里”还是“找目标之前就被拒了”。
+ * expect / sleep 不增加 seenDaemon，但完成了仍增加 completedSteps。
+ */
+export class CancelRun {
+  constructor() {
+    this.runId = 0;
+    this.cancelled = false;
+    this.completedSteps = 0;
+    this.seenDaemon = 0;
+    this.inAct = 0;
+  }
+
+  beginRun() {
+    this.runId += 1;
+    this.cancelled = false;
+    this.completedSteps = 0;
+    this.seenDaemon = 0;
+    return { ok: true, runId: this.runId, completedSteps: 0 };
+  }
+
+  /** 置位。同一 run 内写操作粘住，直到下一次 beginRun。 */
+  cancel() {
+    this.cancelled = true;
+    return this.stickyResult();
+  }
+
+  stickyResult() {
+    return {
+      ok: false,
+      status: "cancelled",
+      reasonCode: "cancelled",
+      completedSteps: this.completedSteps,
+    };
+  }
+
+  enterAct() {
+    this.inAct += 1;
+  }
+
+  leaveAct() {
+    this.inAct = Math.max(0, this.inAct - 1);
+  }
+
+  /** daemon 写命令成功返回。只动写计数，act 的步数由 runActSteps 记。 */
+  noteWriteOk() {
+    this.seenDaemon += 1;
+  }
+
+  noteStepCompleted() {
+    this.completedSteps += 1;
+  }
+
+  /**
+   * daemon 回了 status=cancelled。参数是 daemon 的已投递写步数。
+   * 比 seenDaemon 大，说明这次投递已经发生（等待阶段被取消），这一步计入。
+   * 同一个数字再观察一次不会重复加。
+   */
+  observeDaemonCancel(daemonCompletedSteps) {
+    const n = Number(daemonCompletedSteps);
+    const reported = Number.isFinite(n) ? n : this.seenDaemon;
+    const delivered = reported > this.seenDaemon;
+    this.seenDaemon = Math.max(this.seenDaemon, reported);
+    this.cancelled = true;
+    if (delivered) this.completedSteps += 1;
+    return { delivered, completedSteps: this.completedSteps };
+  }
+}
+
+/** 写命令在已取消时不发往 daemon。只读命令始终 send。 */
+export function gateRpc(gate, cmd) {
+  if (!isWriteCmd(cmd) || !gate.cancelled) return { send: true };
+  return { send: false, result: gate.stickyResult() };
+}
+
+function slimFrom(index, step, r, ms) {
+  const cancelled = r.status === "cancelled" || r.reasonCode === "cancelled";
+  const slim = {
+    index,
+    op: step?.op,
+    ms: Math.round(Number(ms) || 0),
+    ok: !cancelled && r.ok === true,
+  };
+  if (r.via) slim.via = r.via;
+  if (r.action) slim.action = r.action;
+  if (r.changed !== undefined) slim.changed = r.changed;
+  if (r.verification && typeof r.verification === "object") {
+    slim.verification = r.verification.state === "verified"
+      ? "verified"
+      : `unverified${r.verification.reason ? `(${r.verification.reason})` : ""}`;
+  }
+  if (cancelled) slim.reasonCode = "cancelled";
+  else if (r.ok !== true) slim.reasonCode = r.reasonCode || "unknown";
+  return slim;
+}
+
+/**
+ * 纯逻辑跑一轮 act。exec 由调用方提供，这里不碰 socket。
+ * 已取消的步（含等待阶段才返回 cancelled 的那一步）不进入 traceSteps。
+ * 返回里在取消时带 status / cancelled / completedSteps，并保留 steps、failedAt。
+ */
+export async function runActSteps(steps, gate, opts = {}) {
+  const indexBase = Number.isInteger(opts.indexBase) && opts.indexBase >= 0 ? opts.indexBase : 0;
+  const stopOnError = opts.stopOnError !== false;
+  const exec = opts.exec;
+  const results = [];
+  const traceSteps = [];
+  let failedAt = null;
+  let sawCancel = false;
+
+  const pushCancelled = (i, step) => {
+    results.push({
+      index: indexBase + i,
+      op: step?.op,
+      ms: 0,
+      ok: false,
+      reasonCode: "cancelled",
+    });
+  };
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i] ?? {};
+    const index = indexBase + i;
+    if (gate.cancelled) {
+      sawCancel = true;
+      if (failedAt === null) failedAt = i;
+      for (let j = i; j < steps.length; j++) pushCancelled(j, steps[j] ?? {});
+      break;
+    }
+    const completedBefore = gate.completedSteps;
+    const seenBefore = gate.seenDaemon;
+    let r;
+    try {
+      r = await exec(step, i, gate);
+    } catch (e) {
+      r = { ok: false, reasonCode: "js_error", message: e?.message || String(e) };
+    }
+    if (!r || typeof r !== "object") r = { ok: false, reasonCode: "js_error" };
+
+    if (r.status === "cancelled") {
+      sawCancel = true;
+      // rpc 可能已经观察过同一数字；再观察一次不会把步数加上两次。
+      gate.observeDaemonCancel(r.completedSteps);
+      if (failedAt === null) failedAt = i;
+      const ms = r._traced?.stepMs || 0;
+      results.push(slimFrom(index, step, { ...r, ok: false, status: "cancelled" }, ms));
+      for (let j = i + 1; j < steps.length; j++) pushCancelled(j, steps[j] ?? {});
+      break;
+    }
+
+    const deliveredWrite = gate.seenDaemon > seenBefore;
+    if ((r.ok === true || deliveredWrite) && gate.completedSteps === completedBefore) {
+      gate.noteStepCompleted();
+    }
+    const ms = r._traced?.stepMs || 0;
+    results.push(slimFrom(index, step, r, ms));
+    traceSteps.push({ step: index, action: step.op || "unknown" });
+    if (opts.onTrace) await opts.onTrace({ i, index, step, result: r, ms });
+    if (stopOnError && r.ok !== true) {
+      failedAt = i;
+      break;
+    }
+    if (opts.onAfter) await opts.onAfter(i, step, r, gate);
+    // 这一步已经完成。取消落在它和下一步之间：下一步不执行，也不打 trace。
+    if (gate.cancelled && i + 1 < steps.length) {
+      sawCancel = true;
+      if (failedAt === null) failedAt = i + 1;
+      for (let j = i + 1; j < steps.length; j++) pushCancelled(j, steps[j] ?? {});
+      break;
+    }
+  }
+
+  const out = {
+    ok: failedAt === null && !sawCancel,
+    failedAt,
+    steps: results,
+    traceSteps,
+  };
+  if (sawCancel) {
+    out.ok = false;
+    out.status = "cancelled";
+    out.cancelled = true;
+    out.completedSteps = gate.completedSteps;
+  }
+  return out;
+}
+
+const runGate = new CancelRun();
+
+/**
  * 第一次子串命中。有 actions 用 ref（优先 target_ref）；没有则用 rect 中心，
  * 让 daemon 往上找可点祖先。没有可用矩形时退回 ref。
  */
@@ -227,7 +432,24 @@ export function findTargetMatch(elements, text) {
   return { ref: hit.target_ref || hit.ref };
 }
 
+function noteRpcOutcome(req, payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  if (payload.status === "cancelled") {
+    runGate.observeDaemonCancel(payload.completedSteps);
+    if (!payload.reasonCode) payload.reasonCode = "cancelled";
+    return payload;
+  }
+  if (payload.ok === true && isWriteCmd(req.cmd)) {
+    runGate.noteWriteOk();
+    // 单独一次 actAndWait 自己就是一步。act() 里面的步由 runActSteps 记，避免加两次。
+    if (runGate.inAct === 0 && req.cmd === "actAndWait") runGate.noteStepCompleted();
+  }
+  return payload;
+}
+
 function rpc(req) {
+  const gated = gateRpc(runGate, req.cmd);
+  if (!gated.send) return Promise.resolve(gated.result);
   rpcCount++;
   return new Promise((resolve, reject) => {
     const sock = net.createConnection(SOCK);
@@ -244,12 +466,18 @@ function rpc(req) {
       if (buf.includes("\n")) {
         try {
           const parsed = JSON.parse(buf);
+          // 被取消的步骤不出 trace 行。先剥掉 trace，且不写 stderr、不放进 hold。
+          if (parsed && parsed.status === "cancelled") {
+            const { payload } = peelTrace(parsed, { enabled: false });
+            done(null, noteRpcOutcome(req, payload));
+            return;
+          }
           const { payload, lines } = peelTrace(parsed, {
             enabled: traceEnabled(),
             hold: traceHold,
           });
           for (const ev of lines) emitTraceLine(ev);
-          done(null, payload);
+          done(null, noteRpcOutcome(req, payload));
         } catch (e) {
           done(e);
         }
@@ -540,68 +768,67 @@ class App {
       before = summarize(await this._snapshot());
       diffBeforeMs = nsToMs(monoNs() - tDiff);
     }
-    const results = [];
     const built = [];
-    let failedAt = null;
-
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i] ?? {};
-      const held = [];
-      const prevHold = traceHold;
-      if (traceOn) {
-        this._traceAcc = {
-          resolveMs: 0, deliverMs: 0, waitMs: 0, snapshots: 0, waitExit: null, target: null,
-        };
-        traceHold = held;
-      }
-      const t0 = monoNs();
-      let r;
-      try {
-        r = await this._step(step, waitMs);
-      } catch (e) {
-        r = { ok: false, reasonCode: "js_error", message: e?.message || String(e) };
-      } finally {
-        if (traceOn) traceHold = prevHold;
-      }
-      const stepMs = nsToMs(monoNs() - t0);
-      const acc = this._traceAcc;
-      this._traceAcc = null;
-      // 只留报告需要的字段：整份 daemon 响应会把上下文撑爆
-      const index = indexBase + i;
-      const slim = { index, op: step.op, ms: Math.round(stepMs), ok: r.ok === true };
-      if (r.via) slim.via = r.via;
-      if (r.action) slim.action = r.action;
-      if (r.changed !== undefined) slim.changed = r.changed;
-      if (r.verification) {
-        slim.verification = r.verification.state === "verified"
-          ? "verified"
-          : `unverified${r.verification.reason ? `(${r.verification.reason})` : ""}`;
-      }
-      if (r.ok !== true) slim.reasonCode = r.reasonCode || "unknown";
-      results.push(slim);
-      if (traceOn) {
-        built.push({
-          step: index,
-          action: step.op || "unknown",
-          daemonEvents: held,
-          jsResolveMs: acc?.resolveMs || 0,
-          jsDeliverMs: acc?.deliverMs || 0,
-          jsWaitMs: acc?.waitMs || 0,
-          jsSnapshots: acc?.snapshots || 0,
-          waitExit: acc?.waitExit || null,
-          target: acc?.target || null,
-          // 没有 daemon 片段时才用 actMs/waitedMs 兜底，避免和 JS 侧计时叠在一起。
-          fallback: held.length ? null : fallbackFromActResult(r),
-          extraResolveMs: 0,
-          extraSnapshots: 0,
-          totalMs: stepMs,
-        });
-      }
-      if (stopOnError && r.ok === false) {
-        failedAt = i;
-        break;
-      }
+    // begin_run 在 scu js 进程启动时调一次，不在每次 act 里清标记。
+    runGate.enterAct();
+    let outcome;
+    try {
+      outcome = await runActSteps(steps, runGate, {
+        indexBase,
+        stopOnError,
+        exec: async (step) => {
+          const held = [];
+          const prevHold = traceHold;
+          if (traceOn) {
+            this._traceAcc = {
+              resolveMs: 0, deliverMs: 0, waitMs: 0, snapshots: 0, waitExit: null, target: null,
+            };
+            traceHold = held;
+          }
+          const t0 = monoNs();
+          let r;
+          try {
+            r = await this._step(step, waitMs);
+          } catch (e) {
+            r = { ok: false, reasonCode: "js_error", message: e?.message || String(e) };
+          } finally {
+            if (traceOn) traceHold = prevHold;
+          }
+          const stepMs = nsToMs(monoNs() - t0);
+          const acc = this._traceAcc;
+          this._traceAcc = null;
+          if (!r || typeof r !== "object") r = { ok: false, reasonCode: "js_error" };
+          return { ...r, _traced: { held, acc, stepMs } };
+        },
+        // 被取消的步不会走到这里，所以不会有 trace 行，也不会被汇总成 timeout。
+        onTrace: (info) => {
+          if (!traceOn) return;
+          const tr = info.result._traced || { held: [], acc: null, stepMs: 0 };
+          const held = tr.held || [];
+          const acc = tr.acc;
+          built.push({
+            step: info.index,
+            action: info.step?.op || "unknown",
+            daemonEvents: held,
+            jsResolveMs: acc?.resolveMs || 0,
+            jsDeliverMs: acc?.deliverMs || 0,
+            jsWaitMs: acc?.waitMs || 0,
+            jsSnapshots: acc?.snapshots || 0,
+            waitExit: acc?.waitExit || null,
+            target: acc?.target || null,
+            // 没有 daemon 片段时才用 actMs/waitedMs 兜底，避免和 JS 侧计时叠在一起。
+            fallback: held.length ? null : fallbackFromActResult(info.result),
+            extraResolveMs: 0,
+            extraSnapshots: 0,
+            totalMs: tr.stepMs || 0,
+          });
+        },
+      });
+    } finally {
+      runGate.leaveAct();
     }
+    const results = outcome.steps;
+    const failedAt = outcome.failedAt;
 
     let diff = null;
     let diffAfterMs = 0;
@@ -629,13 +856,20 @@ class App {
         this._lastState = after;
       }
       emitBuilt();
-      return {
-        ok: failedAt === null,
+      const report = {
+        ok: outcome.ok,
         failedAt,
         elapsedMs: Math.round(nsToMs(monoNs() - started)),
         diff,
         steps: results,
       };
+      if (outcome.cancelled) {
+        report.ok = false;
+        report.status = "cancelled";
+        report.cancelled = true;
+        report.completedSteps = outcome.completedSteps;
+      }
+      return report;
     } finally {
       emitBuilt();
     }
@@ -832,7 +1066,21 @@ export const scu = {
 const argv = process.argv.slice(2);
 globalThis.scu = scu;
 
+/** 每个 scu js 进程启动时调一次，清掉 daemon 里上次运行留下的取消标记。 */
+async function startRun() {
+  runGate.beginRun();
+  try {
+    const r = await rpc({ cmd: "begin_run" });
+    if (r && r.runId != null && Number.isFinite(Number(r.runId))) {
+      runGate.runId = Number(r.runId);
+    }
+  } catch (err) {
+    console.error("begin_run:", err?.message || err);
+  }
+}
+
 async function main() {
+  await startRun();
   if (argv[0] === "-e") {
     const code = argv[1] ?? "";
     // 用动态 import 的 data: URL 执行，保留顶层 await
