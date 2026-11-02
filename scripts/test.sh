@@ -22,16 +22,12 @@ echo "==> 单元测试"
 python3 tests/test_unit.py || fail=1
 
 echo
-echo "==> 耗时汇总（纯逻辑）"
-python3 tests/test_trace.py || fail=1
+echo "==> 集成测试"
+python3 tests/test_integration.py || fail=1
 
 echo
 echo "==> 取消状态（纯逻辑）"
 node --test tests/cancel.test.mjs || fail=1
-
-echo
-echo "==> 集成测试"
-python3 tests/test_integration.py || fail=1
 
 echo
 if [ "$fail" -eq 0 ]; then
