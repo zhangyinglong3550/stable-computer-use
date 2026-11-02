@@ -1,7 +1,6 @@
 import Cocoa
 import ApplicationServices
 import Foundation
-import os
 
 // MARK: - 常量
 
@@ -1243,68 +1242,81 @@ func cachedPress(_ ref: String) -> [String: Any] {
 //
 // daemon 常驻。一个 run 里的取消标记会粘住，直到下一次 begin_run 清掉，
 // 不能漏到下一次 scu js。置位只有 requestCancel()：cancel 命令现在调它，
-// T3 的 Esc 监听在本进程里也调它（可能在别的线程），所以状态用锁。
+// T3 的 Esc 监听在本进程里也调它。
+//
+// 已知限制：socketLoop 是串行的。accept 到一个连接后，handleClient 跑完
+// 才接受下一个。另一个连接发来的 cancel 会排在正在执行的 actAndWait 后面，
+// 只能在两次调用之间生效，进不了它的等待轮询。等待阶段能提前结束，靠的是
+// 同进程另一线程直接调 requestCancel()（T3 的 Esc 监听会这么用）。
+// 所以这里仍要加锁：socket 线程在轮询里读标记，Esc 线程来置位。
+// 锁内只读写 Bool / Int，字典在锁外组装。
 //
 // 写操作在找目标之前走 guardNotCancelled()，命中就直接返回、不执行。
 // 只读命令不查。投递已经发生才计入 completedSteps。
-// actAndWait 的等待是只读轮询：发现已取消就停，这一步仍算完成，也不再白等超时。
-
-struct RunState: Sendable {
-    var cancelled = false
-    var runId = 0
-    var completedSteps = 0
-}
+// actAndWait 的等待是只读轮询：同进程 requestCancel() 置位后就停，
+// 这一步仍算完成，也不再白等超时。
 
 final class RunCancel {
-    private let state = OSAllocatedUnfairLock(initialState: RunState())
+    private let lock = NSLock()
+    private var cancelled = false
+    private var runId = 0
+    private var completedSteps = 0
 
     func beginRun() -> [String: Any] {
-        state.withLock { s -> [String: Any] in
-            s.cancelled = false
-            s.completedSteps = 0
-            s.runId += 1
-            return ["ok": true, "runId": s.runId, "completedSteps": 0]
-        }
+        lock.lock()
+        cancelled = false
+        completedSteps = 0
+        runId += 1
+        let id = runId
+        let steps = completedSteps
+        lock.unlock()
+        return ["ok": true, "runId": id, "completedSteps": steps]
     }
 
-    /// 置位。不改 completedSteps，不换 runId。
+    /// 置位。不改 completedSteps，不换 runId。可从别的线程调用。
     func markCancelled() {
-        state.withLock { s in
-            s.cancelled = true
-        }
+        lock.lock()
+        cancelled = true
+        lock.unlock()
     }
 
     func isCancelled() -> Bool {
-        state.withLock { $0.cancelled }
+        lock.lock()
+        let value = cancelled
+        lock.unlock()
+        return value
     }
 
     /// 投递已经发生。等待阶段被取消时这一步也算完成。
     func noteDelivered() {
-        state.withLock { s in
-            s.completedSteps += 1
-        }
+        lock.lock()
+        completedSteps += 1
+        lock.unlock()
     }
 
     func cancelledResponse() -> [String: Any] {
-        state.withLock { s -> [String: Any] in
-            [
-                "ok": false,
-                "status": "cancelled",
-                "completedSteps": s.completedSteps,
-            ]
-        }
+        lock.lock()
+        let steps = completedSteps
+        lock.unlock()
+        return [
+            "ok": false,
+            "status": "cancelled",
+            "completedSteps": steps,
+        ]
     }
 
     /// 已取消则返回要直接回给调用方的结果；否则 nil，调用方继续找目标。
     func guardNotCancelled() -> [String: Any]? {
-        state.withLock { s -> [String: Any]? in
-            guard s.cancelled else { return nil }
-            return [
-                "ok": false,
-                "status": "cancelled",
-                "completedSteps": s.completedSteps,
-            ]
-        }
+        lock.lock()
+        let isSet = cancelled
+        let steps = completedSteps
+        lock.unlock()
+        if !isSet { return nil }
+        return [
+            "ok": false,
+            "status": "cancelled",
+            "completedSteps": steps,
+        ]
     }
 }
 
@@ -1317,8 +1329,9 @@ func requestCancel() -> [String: Any] {
     return runCancel.cancelledResponse()
 }
 
-/// handleClient 串行。click/set/type/key/scroll/paste 的成功响应在 writeLine 里记一笔已投递。
-/// actAndWait 自己在进入等待前记账（等待中取消也要算完成），不走这个开关。
+/// 只在串行的 socket 线程上读写：handleClient 跑完一个连接才处理下一个，
+/// 所以这个全局不和 requestCancel() 抢。click/set/type/key/scroll/paste 的成功响应
+/// 在 writeLine 里记一笔已投递。actAndWait 自己在进入等待前记账，不走这个开关。
 var countWriteDelivery = false
 
 func writeLine(_ fd: Int32, _ obj: [String: Any]) {
