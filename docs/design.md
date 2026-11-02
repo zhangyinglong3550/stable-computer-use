@@ -382,5 +382,6 @@ python3 bench/run.py --runs 10
 1. 一步等于 `act` 数组里的一个操作，或一次单独的 `actAndWait`，不是一次 `act` 调用。`step` 从 0 开始；按 `indexBase` 续号时，结果里的 `index` 仍和 trace 里的 `step` 对齐。
 2. `wait_exit` 是可选字段，只在真的进入等待时才有，值为 `changed` 或 `timeout`。`text_not_found`、`cache_miss` 这类没进入等待的失败没有它。
 3. `snapshots` 是附加字段，记这一步里做了几次快照。
+4. `target` 只在 `SCU_TRACE=1` 时出现，内容是文字点击命中的节点名，可能是会话名或消息文字，含用户界面上的文字，写到 stderr。贴到群里、报告或 issue 之前要先检查并脱敏。
 
 `resolve_ms` 是找目标的时间，包括取快照和定位，`actAndWait` 动作前那次轻量快照（`wait_before`）记在这里。`deliver_ms` 是把动作投递出去的时间。`wait_ms` 是等到界面变化或超时的整段时间，轮询快照和中间的等待都算在里面。`verify_ms` 是校验写入或核对结果的时间。
