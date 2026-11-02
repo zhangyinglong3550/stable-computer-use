@@ -1,0 +1,40 @@
+name: ci
+
+# 这条流水线只在 ubuntu-latest 上跑不碰 AX、不启动真实应用的纯逻辑测试。
+# 它不能替代 Mac 上的 `swift build` 和真机验证（辅助功能权限、AX 集成、微信基线）。
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  logic:
+    name: pure-logic
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+
+      - name: setup python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: setup node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # 与云端实测命令一致。main 上的纯逻辑测试只有 tests/test_unit.py。
+      # tests/test_trace.py 不在 main（在 PR #3），不写进命令。
+      # tests/test_integration.py 会调用 scu-ax，依赖 macOS / Swift，不在这里跑。
+      - name: python unit tests
+        run: python3 -m unittest tests/test_unit.py
+
+      # 与云端实测命令一致：node --test。
+      # main 上没有 *.test.js / *.test.mjs，当前匹配 0 个文件，退出码 0。
+      # 不写 tests/cancel.test.mjs：该文件不在 main（在 PR #2），指定路径会直接失败。
+      - name: node tests
+        run: node --test
