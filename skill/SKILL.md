@@ -166,7 +166,7 @@ scu shot --app X --out /tmp/a.png --crop 520,40,700,120   # x,y,w,h（图像像�
 scu shot --app X --out /tmp/a.png --scale 0.5              # 或者整体缩小
 ```
 
-注意：`-R` 矩形截图会带上**盖在上面的其他窗口**，不是纯净窗口图。
+注意：`scu shot` 优先按窗口 ID 截图（`screencapture -l <windowID>`）。拿不到窗口 ID 才退回 `-R` 矩形截图，这时会带上盖在上面的其他窗口，响应里带 `note`。
 
 ## 也可以用 batch（JSONL）
 
