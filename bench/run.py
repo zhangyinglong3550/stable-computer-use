@@ -5,6 +5,7 @@
   python3 bench/run.py                 # 全部
   python3 bench/run.py --latency-only
   python3 bench/run.py --app com.apple.finder
+  python3 bench/run.py --trace-file run1.jsonl --trace-file run2.jsonl
 
 输出刻意做成 markdown 表格，可以直接贴进 README。
 """
@@ -100,13 +101,39 @@ def accuracy(apps: list[str]) -> None:
     print()
 
 
+def _load_scu_trace():
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "scu_trace.py"
+    spec = importlib.util.spec_from_file_location("scu_bench_trace", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def summarize_trace_files(paths: list[str]) -> dict:
+    """汇总若干次运行的 SCU_TRACE 输出。每个文件是一次运行。"""
+    texts = [Path(p).read_text(encoding="utf-8") for p in paths]
+    return _load_scu_trace().summarize_runs(texts)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--app", action="append")
     ap.add_argument("--runs", type=int, default=10)
     ap.add_argument("--latency-only", action="store_true")
     ap.add_argument("--accuracy-only", action="store_true")
+    ap.add_argument(
+        "--trace-file",
+        action="append",
+        default=None,
+        help="汇总 SCU_TRACE=1 的 JSON 行。可重复，每个文件是一次运行。给出后只做汇总，不跑快照基准。",
+    )
     args = ap.parse_args()
+
+    if args.trace_file:
+        print(json.dumps(summarize_trace_files(args.trace_file), ensure_ascii=False, indent=2))
+        return 0
 
     apps = args.app or ["com.apple.finder", "com.google.Chrome", "com.electron.lark"]
     if not args.accuracy_only:
