@@ -106,10 +106,17 @@ export function fallbackFromActResult(result) {
   return out;
 }
 
+/** wait_exit 的合法取值。cancelled 表示等待被取消提前结束，不是超时。 */
+const WAIT_EXITS = new Set(["changed", "timeout", "cancelled"]);
+
+function isWaitExit(v) {
+  return typeof v === "string" && WAIT_EXITS.has(v);
+}
+
 /**
  * 把一步里的 daemon 片段和 JS 侧快照合成一行。
  * extraResolveMs / extraSnapshots 用来装 act() 的 diff_before / diff_after。
- * wait_exit 只有 changed 或 timeout；没有等待概念的失败不写这个字段。
+ * wait_exit 只有 changed / timeout / cancelled；没有等待概念的失败不写这个字段。
  */
 export function composeStepTrace(input) {
   const events = Array.isArray(input.daemonEvents) ? input.daemonEvents : [];
@@ -119,7 +126,7 @@ export function composeStepTrace(input) {
   let verify = 0;
   let snapshots = Number(input.jsSnapshots) || 0;
   let tier = "ax";
-  let waitExit = input.waitExit === "changed" || input.waitExit === "timeout" ? input.waitExit : null;
+  let waitExit = isWaitExit(input.waitExit) ? input.waitExit : null;
   let usedDaemon = false;
   for (const ev of events) {
     if (!ev || typeof ev !== "object") continue;
@@ -130,7 +137,7 @@ export function composeStepTrace(input) {
     verify += Number(ev.verify_ms) || 0;
     snapshots += Number(ev.snapshots) || 0;
     if (ev.tier === "ax" || ev.tier === "pid" || ev.tier === "mouse") tier = ev.tier;
-    if (ev.wait_exit === "changed" || ev.wait_exit === "timeout") waitExit = ev.wait_exit;
+    if (isWaitExit(ev.wait_exit)) waitExit = ev.wait_exit;
   }
   if (!usedDaemon) {
     deliver += Number(input.jsDeliverMs) || 0;
@@ -139,9 +146,7 @@ export function composeStepTrace(input) {
       deliver += Number(fb.deliverMs) || 0;
       wait += Number(fb.waitMs) || 0;
       if (fb.tier === "ax" || fb.tier === "pid" || fb.tier === "mouse") tier = fb.tier;
-      if (!waitExit && (fb.waitExit === "changed" || fb.waitExit === "timeout")) {
-        waitExit = fb.waitExit;
-      }
+      if (!waitExit && isWaitExit(fb.waitExit)) waitExit = fb.waitExit;
     }
   }
   resolve += Number(input.extraResolveMs) || 0;
@@ -185,6 +190,38 @@ export function attributeFindSnapshot(snapshotMs) {
   };
 }
 
+/**
+ * 可取消的等待。取消标记置位后立刻结束，不等到 ms 用完。
+ * 按至多 50ms 切片检查本地标记；daemonPoll 时每 100ms 再问一次 daemon，
+ * 让另一个进程发来的 cancel 也能打断睡眠（跨进程取消只在请求之间生效）。
+ */
+async function cancellableSleep(ms, opts = {}) {
+  const daemonPoll = opts.daemonPoll === true;
+  const slice = daemonPoll ? 100 : 50;
+  let left = Math.max(0, Number(ms) || 0);
+  while (left > 0) {
+    if (runGate.cancelled) return;
+    const t = monoNs();
+    await new Promise((r) => setTimeout(r, Math.min(left, slice)));
+    left -= Math.max(1, nsToMs(monoNs() - t));
+    if (!daemonPoll || left <= 0) continue;
+    await pollRunCancelled();
+  }
+}
+
+/**
+ * 只读心跳。daemon 在带 runId 的响应上捎回 runCancelled，
+ * 这里据此置位本地取消标记。daemon 不可用不算失败：睡眠继续。
+ */
+async function pollRunCancelled() {
+  if (!(runGate.runId > 0)) return;
+  try {
+    await rpc({ cmd: "ping" }, 500);
+  } catch {
+    // 心跳失败不改变睡眠语义。
+  }
+}
+
 /** label/value 里含 text 的可见元素个数。空 text 不算命中。 */
 export function countTextHits(elements, text) {
   if (!text) return 0;
@@ -220,6 +257,28 @@ export function hitTargetLabel(elements, text) {
 export function isWriteCmd(cmd) {
   return cmd === "act" || cmd === "actAndWait" || cmd === "type" || cmd === "key"
     || cmd === "click" || cmd === "paste" || cmd === "set" || cmd === "scroll";
+}
+
+/**
+ * 哪些请求带 runId：写命令（daemon 会按 runId 拦），以及 snapshot / ping
+ * （等待轮询用：只读响应靠 runId 捎回 runCancelled，请求本身永远不被拦）。
+ * begin_run / cancel 不带：它们不属于任何 run。
+ */
+export function carriesRunId(cmd) {
+  return isWriteCmd(cmd) || cmd === "snapshot" || cmd === "ping";
+}
+
+/**
+ * 写命令带上当前 runId，daemon 只拦截「带 runId 且等于当前 runId」的写请求。
+ * snapshot / ping 也带，用来接收只读响应里的 runCancelled 标记。
+ * 没有 runId 的写请求（单独的命令行命令）不受任何 run 的取消影响。
+ * 返回新对象，不改入参。
+ */
+export function withRunId(req, runId) {
+  if (!req || !carriesRunId(req.cmd)) return req;
+  const id = Number(runId);
+  if (!Number.isFinite(id)) return req;
+  return { ...req, runId: id };
 }
 
 /**
@@ -370,11 +429,17 @@ export async function runActSteps(steps, gate, opts = {}) {
 
     if (r.status === "cancelled") {
       sawCancel = true;
-      // rpc 可能已经观察过同一数字；再观察一次不会把步数加上两次。
-      gate.observeDaemonCancel(r.completedSteps);
+      // 投递是否已经发生：daemon 的计数涨了，或者 rpc 已经观察过这次取消。
+      // 这一步算完成（动作已送出），trace 要有一行，wait_exit=cancelled；不算超时。
+      const delivered = gate.seenDaemon > seenBefore;
+      const observed = gate.observeDaemonCancel(r.completedSteps);
       if (failedAt === null) failedAt = i;
       const ms = r._traced?.stepMs || 0;
       results.push(slimFrom(index, step, { ...r, ok: false, status: "cancelled" }, ms));
+      if (delivered || observed.delivered) {
+        traceSteps.push({ step: index, action: step.op || "unknown" });
+        if (opts.onTrace) await opts.onTrace({ i, index, step, result: r, ms });
+      }
       for (let j = i + 1; j < steps.length; j++) pushCancelled(j, steps[j] ?? {});
       break;
     }
@@ -434,6 +499,11 @@ export function findTargetMatch(elements, text) {
 
 function noteRpcOutcome(req, payload) {
   if (!payload || typeof payload !== "object") return payload;
+  if (payload.runCancelled === true) {
+    // daemon 在只读响应上捎回的取消标记：这次请求照常返回了结果，但本 run 已取消。
+    // 后续写命令本地就不再发；等待轮询（waitFor / expect / sleep）据此提前结束。
+    runGate.cancelled = true;
+  }
   if (payload.status === "cancelled") {
     runGate.observeDaemonCancel(payload.completedSteps);
     if (!payload.reasonCode) payload.reasonCode = "cancelled";
@@ -447,9 +517,11 @@ function noteRpcOutcome(req, payload) {
   return payload;
 }
 
-function rpc(req) {
+function rpc(req, timeoutMs = TIMEOUT) {
   const gated = gateRpc(runGate, req.cmd);
   if (!gated.send) return Promise.resolve(gated.result);
+  // 写操作带上当前 runId，daemon 才能判断这次取消是不是针对这个 run。
+  const outbound = withRunId(req, runGate.runId);
   rpcCount++;
   return new Promise((resolve, reject) => {
     const sock = net.createConnection(SOCK);
@@ -459,8 +531,8 @@ function rpc(req) {
       err ? reject(err) : resolve(val);
     };
     sock.setEncoding("utf8");
-    sock.setTimeout(TIMEOUT, () => done(new Error(`rpc timeout: ${req.cmd}`)));
-    sock.on("connect", () => sock.write(JSON.stringify(req) + "\n"));
+    sock.setTimeout(timeoutMs, () => done(new Error(`rpc timeout: ${req.cmd}`)));
+    sock.on("connect", () => sock.write(JSON.stringify(outbound) + "\n"));
     sock.on("data", (d) => {
       buf += d;
       if (buf.includes("\n")) {
@@ -798,9 +870,12 @@ class App {
           const acc = this._traceAcc;
           this._traceAcc = null;
           if (!r || typeof r !== "object") r = { ok: false, reasonCode: "js_error" };
+          // 取消打断的是「动作已投递、正在等界面」：这一步算完成，trace 里
+          // wait_exit 记 cancelled。投放前就被拒的取消不走到这里打 trace。
+          if (acc && r.status === "cancelled") acc.waitExit = "cancelled";
           return { ...r, _traced: { held, acc, stepMs } };
         },
-        // 被取消的步不会走到这里，所以不会有 trace 行，也不会被汇总成 timeout。
+        // 投递之前就被取消的步不会走到这里，所以没有 trace 行，也不会被汇总成 timeout。
         onTrace: (info) => {
           if (!traceOn) return;
           const tr = info.result._traced || { held: [], acc: null, stepMs: 0 };
@@ -953,13 +1028,15 @@ class App {
         }
         return hit
           ? { ok: true, verification: { state: "verified", source: "expect " + what } }
-          : { ok: false, reasonCode: "expect_timeout", expect: what };
+          : runGate.cancelled
+            ? runGate.stickyResult()
+            : { ok: false, reasonCode: "expect_timeout", expect: what };
       }
       case "sleep": {
         const t = monoNs();
-        await new Promise((r) => setTimeout(r, step.ms ?? 100));
+        await cancellableSleep(step.ms ?? 100, { daemonPoll: true });
         this._noteWait(nsToMs(monoNs() - t));
-        return { ok: true };
+        return runGate.cancelled ? runGate.stickyResult() : { ok: true };
       }
       default:
         return { ok: false, reasonCode: "unknown_op", op: step.op };
@@ -998,9 +1075,17 @@ class App {
     const timeoutMs = opts.timeoutMs ?? 3000;
     const deadline = monoNs() + BigInt(timeoutMs) * 1_000_000n;
     while (monoNs() < deadline) {
+      // 被取消就立刻结束：不睡满超时，也不把这一轮记成 timeout。
+      if (runGate.cancelled) return false;
       const tSnap = monoNs();
       const snap = await rpc({ cmd: "snapshot", app: this.name, max: 4000, actions: false });
       const snapMs = nsToMs(monoNs() - tSnap);
+      if (runGate.cancelled) {
+        // 这次快照带回了取消标记：这一轮照常算 wait，但不再判命中、不再等。
+        const part = attributeWaitPoll(snapMs, 0);
+        this._noteWait(part.waitMs, part.snapshots);
+        return false;
+      }
       if (snap.ok !== false && fn(snap.elements || [], snap)) {
         // 命中这一轮没有 sleep，快照本身仍算 wait。
         const part = attributeWaitPoll(snapMs, 0);
@@ -1009,9 +1094,10 @@ class App {
         return true;
       }
       const tSleep = monoNs();
-      await new Promise((r) => setTimeout(r, 80));
+      await cancellableSleep(80);
       const part = attributeWaitPoll(snapMs, nsToMs(monoNs() - tSleep));
       this._noteWait(part.waitMs, part.snapshots);
+      if (runGate.cancelled) return false;
     }
     this._noteWaitExit("timeout");
     return false;
@@ -1053,7 +1139,7 @@ export const scu = {
   async ping() {
     return rpc({ cmd: "ping" });
   },
-  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  sleep: (ms) => cancellableSleep(ms, { daemonPoll: true }),
   log: (...a) => console.log(...a),
   countTextHits,
   get rpcCount() {
@@ -1066,17 +1152,25 @@ export const scu = {
 const argv = process.argv.slice(2);
 globalThis.scu = scu;
 
-/** 每个 scu js 进程启动时调一次，清掉 daemon 里上次运行留下的取消标记。 */
+/**
+ * 每个 scu js 进程启动时调一次，清掉 daemon 里上次运行留下的取消标记。
+ * 失败必须抛出：runId 拿不到就没法把写请求绑到本次 run，取消机制会失效。
+ * 调用方（main）捕获后以非 0 退出，不能只打一行 stderr 继续跑脚本。
+ */
 async function startRun() {
   runGate.beginRun();
+  let r;
   try {
-    const r = await rpc({ cmd: "begin_run" });
-    if (r && r.runId != null && Number.isFinite(Number(r.runId))) {
-      runGate.runId = Number(r.runId);
-    }
+    r = await rpc({ cmd: "begin_run" });
   } catch (err) {
-    console.error("begin_run:", err?.message || err);
+    throw new Error(`begin_run 失败：daemon 不可用（${err?.message || err}）`);
   }
+  const runId = Number(r?.runId);
+  if (!r || r.ok !== true || !Number.isFinite(runId)) {
+    throw new Error(`begin_run 失败：${r?.reasonCode || "bad_response"}`);
+  }
+  runGate.runId = runId;
+  runGate.completedSteps = Number(r.completedSteps) || 0;
 }
 
 async function main() {
