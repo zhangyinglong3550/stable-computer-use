@@ -28,6 +28,10 @@ python3 tests/test_trace.py || fail=1
 python3 tests/test_cancel.py || fail=1
 
 echo
+echo "==> 取消机制（node）"
+node --test tests/cancel.test.mjs || fail=1
+
+echo
 echo "==> 集成测试"
 python3 tests/test_integration.py || fail=1
 

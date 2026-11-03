@@ -380,7 +380,13 @@ python3 bench/run.py --runs 10
 `SCU_TRACE=1` 时，调用方进程的 stderr 上每一步一行 JSON。口径如下。
 
 1. 一步等于 `act` 数组里的一个操作，或一次单独的 `actAndWait`，不是一次 `act` 调用。`step` 从 0 开始；按 `indexBase` 续号时，结果里的 `index` 仍和 trace 里的 `step` 对齐。
-2. `wait_exit` 是可选字段，只在真的进入等待时才有，值为 `changed` 或 `timeout`。`text_not_found`、`cache_miss` 这类没进入等待的失败没有它。
+2. `wait_exit` 是可选字段，只在真的进入等待时才有，值为 `changed`、`timeout` 或 `cancelled`。`text_not_found`、`cache_miss` 这类没进入等待的失败没有它。`cancelled` 表示等待被取消提前结束，不是超时；它不进超时命中率的分母。
 3. `snapshots` 是附加字段，记这一步里做了几次快照。
 
 `resolve_ms` 是找目标的时间，包括取快照和定位，`actAndWait` 动作前那次轻量快照（`wait_before`）记在这里。`deliver_ms` 是把动作投递出去的时间。`wait_ms` 是等到界面变化或超时的整段时间，轮询快照和中间的等待都算在里面。`verify_ms` 是校验写入或核对结果的时间。
+
+取消与 `wait_exit` 的关系：一步的动作已经投递、取消打断的是这一步的等待时，该步算已完成（`completedSteps` 包含它），照常输出一行 trace，`wait_exit` 记 `cancelled`。取消发生在某步动作送出之前时，该步不执行，不输出 trace，不计入 `completedSteps`，也不算超时。
+
+`cancel` 对跨进程的调用方只在两次请求之间生效。为了不让 `expect` 的轮询白等到超时，daemon 对带 `runId` 且该 run 已取消的**只读**请求照常执行、照常返回结果，只在响应上多带一个 `runCancelled: true`。JS 侧据此停止等待，返回 `status: "cancelled"`，不记成 `expect_timeout`。
+
+降级：`SCU_HUD=0`（CI / 无 WindowServer）时 daemon 退出 AppKit、socket 循环直接占用主线程，进程内的 Esc 监听没有 runloop 可跑。这种模式下只剩「调用之间的取消」：另一个连接发来的 `cancel` 排在正在执行的 `actAndWait` 之后，只能在两次 RPC 之间生效，进不了它的等待轮询。等待阶段能被提前打断，依赖同进程另一线程调用 `requestCancel()`（HUD 开着时的 Esc 监听就是这么用的）。

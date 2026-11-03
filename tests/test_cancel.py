@@ -157,7 +157,7 @@ if (second.ok !== true || second.steps[0].index !== 2) {
 if (lined.completedSteps !== 3) throw new Error("lined count " + lined.completedSteps);
 if (second.traceSteps[0].step !== 2) throw new Error("trace step " + JSON.stringify(second.traceSteps));
 
-// 等待阶段取消：第 2 步已经投递，计入 completedSteps，但不出 trace。
+// 等待阶段取消：第 2 步已经投递，计入 completedSteps，也出一行 trace。
 const waitGate = new CancelRun();
 waitGate.beginRun();
 const waitedCalls = [];
@@ -178,8 +178,11 @@ if (waited.steps[1].reasonCode !== "cancelled" || waited.steps[1].ok !== false) 
   throw new Error("wait step " + JSON.stringify(waited.steps[1]));
 }
 if (waited.steps[2].reasonCode !== "cancelled") throw new Error("tail not cancelled");
-if (waited.traceSteps.length !== 1 || waited.traceSteps[0].step !== 0 || waited.traceSteps[0].action !== "click") {
-  throw new Error("wait trace " + JSON.stringify(waited.traceSteps));
+if (waited.traceSteps.map((t) => t.step).join(",") !== "0,1") {
+  throw new Error("delivered cancel needs a trace line " + JSON.stringify(waited.traceSteps));
+}
+if (waited.traceSteps[1].action !== "type") {
+  throw new Error("cancel trace action " + JSON.stringify(waited.traceSteps[1]));
 }
 // 同一个 daemon 计数再观察一次，不能把步数加上两次。
 const againObs = waitGate.observeDaemonCancel(2);
@@ -209,7 +212,7 @@ console.log("ok");
         self.assertIn("ok", proc.stdout)
 
     def test_omitted_cancelled_step_is_not_a_timeout(self):
-        """被取消的步没有 trace 行，汇总不能把它算进 timeout 分母。"""
+        """投递前就被取消的步没有 trace 行，汇总不能把它算进 timeout 分母。"""
         events = [
             {"step": 0, "action": "click", "total_ms": 10, "wait_exit": "changed",
              "resolve_ms": 1, "deliver_ms": 1, "wait_ms": 1, "verify_ms": 0},
@@ -226,6 +229,23 @@ console.log("ok");
         # 行里也不该出现 cancelled 标记；缺席就是缺席。
         blob = json.dumps(events)
         self.assertNotIn("cancelled", blob)
+
+    def test_cancelled_wait_is_not_a_timeout(self):
+        """等待阶段被取消的步有 trace 行，wait_exit=cancelled，不进超时分母。"""
+        events = [
+            {"step": 0, "action": "click", "total_ms": 10, "wait_exit": "changed",
+             "resolve_ms": 1, "deliver_ms": 1, "wait_ms": 1, "verify_ms": 0},
+            {"step": 1, "action": "type", "total_ms": 12, "wait_exit": "cancelled",
+             "resolve_ms": 1, "deliver_ms": 1, "wait_ms": 4, "verify_ms": 0},
+        ]
+        report = stats.summarize_runs(
+            [{"ok": False, "elapsed_ms": 30, "wall_ms": 40, "events": events}],
+            expected=2,
+        )
+        self.assertEqual([s["step"] for s in report["steps"]], [0, 1])
+        # cancelled 不是 changed，也不是 timeout：不进分母。
+        self.assertTrue(all(row["step"] != 1 for row in report["timeouts"]))
+        self.assertEqual(report["timeouts"][0]["step"], 0)
 
 
 if __name__ == "__main__":
