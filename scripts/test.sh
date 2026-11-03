@@ -20,6 +20,7 @@ fail=0
 echo
 echo "==> 单元测试"
 python3 tests/test_unit.py || fail=1
+python3 tests/test_trace.py || fail=1
 
 echo
 echo "==> 集成测试"
