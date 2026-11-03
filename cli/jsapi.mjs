@@ -260,17 +260,26 @@ export function isWriteCmd(cmd) {
 }
 
 /**
- * 哪些请求带 runId：写命令（daemon 会按 runId 拦），以及 snapshot / ping
- * （等待轮询用：只读响应靠 runId 捎回 runCancelled，请求本身永远不被拦）。
- * begin_run / cancel 不带：它们不属于任何 run。
+ * daemon 会按 runId 拦的命令：写命令 + activate（换前台应用也算写）。
+ * activate 不计投递步数，只拦执行；所以单独用这个判断，不动 isWriteCmd 的计数口径。
  */
-export function carriesRunId(cmd) {
-  return isWriteCmd(cmd) || cmd === "snapshot" || cmd === "ping";
+export function isGuardedCmd(cmd) {
+  return isWriteCmd(cmd) || cmd === "activate";
 }
 
 /**
- * 写命令带上当前 runId，daemon 只拦截「带 runId 且等于当前 runId」的写请求。
- * snapshot / ping 也带，用来接收只读响应里的 runCancelled 标记。
+ * 哪些请求带 runId：guarded 命令（daemon 会按 runId 拦），以及 snapshot / ping
+ * （等待轮询用：只读响应靠 runId 捎回 runCancelled / runStale，请求本身永远不被拦）。
+ * begin_run / cancel 不带：它们不属于任何 run。
+ */
+export function carriesRunId(cmd) {
+  return isGuardedCmd(cmd) || cmd === "snapshot" || cmd === "ping";
+}
+
+/**
+ * 写命令带上当前 runId，daemon 只执行「带 runId 且等于当前 runId」的写请求，
+ * runId 过期回 stale_run，当前 run 被取消回 cancelled。
+ * snapshot / ping 也带，用来接收只读响应里的 runCancelled / runStale 标记。
  * 没有 runId 的写请求（单独的命令行命令）不受任何 run 的取消影响。
  * 返回新对象，不改入参。
  */
@@ -296,6 +305,7 @@ export class CancelRun {
   constructor() {
     this.runId = 0;
     this.cancelled = false;
+    this.stale = false;
     this.completedSteps = 0;
     this.seenDaemon = 0;
     this.inAct = 0;
@@ -304,6 +314,7 @@ export class CancelRun {
   beginRun() {
     this.runId += 1;
     this.cancelled = false;
+    this.stale = false;
     this.completedSteps = 0;
     this.seenDaemon = 0;
     return { ok: true, runId: this.runId, completedSteps: 0 };
@@ -315,13 +326,26 @@ export class CancelRun {
     return this.stickyResult();
   }
 
+  /**
+   * daemon 说这个 runId 已经不是当前 run（别的进程 begin_run 了）。
+   * 和取消一样粘住；结果仍用 status:"cancelled"，reasonCode 记 stale_run。
+   */
+  markStale() {
+    this.cancelled = true;
+    this.stale = true;
+    return this.stickyResult();
+  }
+
+  /** 本地拦下的结果。local:true 表示没有发生 daemon 投递，不能按 daemon 计数。 */
   stickyResult() {
-    return {
+    const out = {
       ok: false,
       status: "cancelled",
-      reasonCode: "cancelled",
+      local: true,
       completedSteps: this.completedSteps,
     };
+    out.reasonCode = this.stale ? "stale_run" : "cancelled";
+    return out;
   }
 
   enterAct() {
@@ -357,14 +381,15 @@ export class CancelRun {
   }
 }
 
-/** 写命令在已取消时不发往 daemon。只读命令始终 send。 */
+/** 写命令（含 activate）在已取消/过期时不发往 daemon。只读命令始终 send。 */
 export function gateRpc(gate, cmd) {
-  if (!isWriteCmd(cmd) || !gate.cancelled) return { send: true };
+  if (!isGuardedCmd(cmd) || !gate.cancelled) return { send: true };
   return { send: false, result: gate.stickyResult() };
 }
 
 function slimFrom(index, step, r, ms) {
-  const cancelled = r.status === "cancelled" || r.reasonCode === "cancelled";
+  const cancelled = r.status === "cancelled" || r.reasonCode === "cancelled"
+    || r.reasonCode === "stale_run";
   const slim = {
     index,
     op: step?.op,
@@ -379,7 +404,7 @@ function slimFrom(index, step, r, ms) {
       ? "verified"
       : `unverified${r.verification.reason ? `(${r.verification.reason})` : ""}`;
   }
-  if (cancelled) slim.reasonCode = "cancelled";
+  if (cancelled) slim.reasonCode = r.reasonCode || "cancelled";
   else if (r.ok !== true) slim.reasonCode = r.reasonCode || "unknown";
   return slim;
 }
@@ -387,6 +412,8 @@ function slimFrom(index, step, r, ms) {
 /**
  * 纯逻辑跑一轮 act。exec 由调用方提供，这里不碰 socket。
  * 已取消的步（含等待阶段才返回 cancelled 的那一步）不进入 traceSteps。
+ * completedSteps 与 trace 只认 daemon 确认的写投递：本地拦下的结果带 local:true，
+ * 不参与 daemon 计数比较，避免前面有 expect / sleep 时把后面被拦的写算成已投递。
  * 返回里在取消时带 status / cancelled / completedSteps，并保留 steps、failedAt。
  */
 export async function runActSteps(steps, gate, opts = {}) {
@@ -397,6 +424,9 @@ export async function runActSteps(steps, gate, opts = {}) {
   const traceSteps = [];
   let failedAt = null;
   let sawCancel = false;
+  let sawStale = false;
+
+  const cancelReason = () => (gate.stale ? "stale_run" : "cancelled");
 
   const pushCancelled = (i, step) => {
     results.push({
@@ -404,7 +434,7 @@ export async function runActSteps(steps, gate, opts = {}) {
       op: step?.op,
       ms: 0,
       ok: false,
-      reasonCode: "cancelled",
+      reasonCode: cancelReason(),
     });
   };
 
@@ -413,6 +443,7 @@ export async function runActSteps(steps, gate, opts = {}) {
     const index = indexBase + i;
     if (gate.cancelled) {
       sawCancel = true;
+      if (gate.stale) sawStale = true;
       if (failedAt === null) failedAt = i;
       for (let j = i; j < steps.length; j++) pushCancelled(j, steps[j] ?? {});
       break;
@@ -427,16 +458,28 @@ export async function runActSteps(steps, gate, opts = {}) {
     }
     if (!r || typeof r !== "object") r = { ok: false, reasonCode: "js_error" };
 
-    if (r.status === "cancelled") {
+    if (r.status === "cancelled" || r.reasonCode === "stale_run") {
       sawCancel = true;
-      // 投递是否已经发生：daemon 的计数涨了，或者 rpc 已经观察过这次取消。
-      // 这一步算完成（动作已送出），trace 要有一行，wait_exit=cancelled；不算超时。
-      const delivered = gate.seenDaemon > seenBefore;
-      const observed = gate.observeDaemonCancel(r.completedSteps);
+      const stale = r.reasonCode === "stale_run";
+      if (stale) {
+        sawStale = true;
+        // 别的进程换 run 了：本 run 的后续写都按 stale_run 本地拦住。
+        gate.markStale();
+      }
+      // 只有 daemon 确认的投递才算完成。本地拦下的结果（local:true，比如
+      // expect / sleep 之后、_findTarget 的快照带回取消时 gateRpc 返回的）
+      // 和 stale_run（daemon 根本没执行）都不参与 daemon 计数比较，
+      // 否则前面完成过的 expect / sleep 会把后面被拦的写误判成已投递。
+      const local = r.local === true || stale;
+      const delivered = !local && gate.seenDaemon > seenBefore;
+      const observed = local
+        ? { delivered: false, completedSteps: gate.completedSteps }
+        : gate.observeDaemonCancel(r.completedSteps);
       if (failedAt === null) failedAt = i;
       const ms = r._traced?.stepMs || 0;
       results.push(slimFrom(index, step, { ...r, ok: false, status: "cancelled" }, ms));
       if (delivered || observed.delivered) {
+        // 投递已经发生、取消打断的是等待：这一步算完成，trace 带 wait_exit=cancelled。
         traceSteps.push({ step: index, action: step.op || "unknown" });
         if (opts.onTrace) await opts.onTrace({ i, index, step, result: r, ms });
       }
@@ -460,6 +503,7 @@ export async function runActSteps(steps, gate, opts = {}) {
     // 这一步已经完成。取消落在它和下一步之间：下一步不执行，也不打 trace。
     if (gate.cancelled && i + 1 < steps.length) {
       sawCancel = true;
+      if (gate.stale) sawStale = true;
       if (failedAt === null) failedAt = i + 1;
       for (let j = i + 1; j < steps.length; j++) pushCancelled(j, steps[j] ?? {});
       break;
@@ -477,11 +521,50 @@ export async function runActSteps(steps, gate, opts = {}) {
     out.status = "cancelled";
     out.cancelled = true;
     out.completedSteps = gate.completedSteps;
+    // 不新增 status：过期 run 也是 cancelled，只换 reasonCode。
+    if (sawStale) out.reasonCode = "stale_run";
   }
   return out;
 }
 
 const runGate = new CancelRun();
+
+/**
+ * 脚本级取消 / 过期。waitFor、sleep 和每个写 API 在发现取消（含 stale_run）时抛出，
+ * 避免把 false / undefined 当成普通结果继续往下跑。act() 不抛，仍返回
+ * status:"cancelled"，和 design.md 的口径一致。
+ *
+ * scu js 顶层捕获后输出 {ok:false,status:"cancelled",completedSteps:n}（stale 时
+ * 多带 reasonCode:"stale_run"），退出码 130；其它异常仍是 stderr + 退出码 1。
+ */
+export class CancelledError extends Error {
+  constructor({ reasonCode = "cancelled", completedSteps = 0 } = {}) {
+    super(reasonCode === "stale_run" ? "cancelled (stale_run)" : "cancelled");
+    this.name = "CancelledError";
+    this.ok = false;
+    this.status = "cancelled";
+    this.reasonCode = reasonCode;
+    this.completedSteps = completedSteps;
+    this.cancelled = true;
+  }
+}
+
+/** 由 run 当前状态构造取消错误。reasonCode 只有 cancelled / stale_run。 */
+function cancelledError(gate = runGate) {
+  return new CancelledError({
+    reasonCode: gate.stale ? "stale_run" : "cancelled",
+    completedSteps: gate.completedSteps,
+  });
+}
+
+/** daemon / 本地拦下的结果若是取消（含 stale_run），抛 CancelledError；否则原样返回。 */
+function throwIfCancelled(r) {
+  if (r && (r.status === "cancelled" || r.reasonCode === "cancelled"
+    || r.reasonCode === "stale_run")) {
+    throw cancelledError(runGate);
+  }
+  return r;
+}
 
 /**
  * 第一次子串命中。有 actions 用 ref（优先 target_ref）；没有则用 rect 中心，
@@ -499,10 +582,20 @@ export function findTargetMatch(elements, text) {
 
 function noteRpcOutcome(req, payload) {
   if (!payload || typeof payload !== "object") return payload;
-  if (payload.runCancelled === true) {
+  if (payload.runStale === true) {
+    // daemon 在只读响应上捎回的过期标记：runId 已经被别的进程换掉了。
+    // 请求照常拿到结果，但后续写命令本地不再发，等待轮询立刻停。
+    runGate.markStale();
+  } else if (payload.runCancelled === true) {
     // daemon 在只读响应上捎回的取消标记：这次请求照常返回了结果，但本 run 已取消。
     // 后续写命令本地就不再发；等待轮询（waitFor / expect / sleep）据此提前结束。
     runGate.cancelled = true;
+  }
+  if (payload.reasonCode === "stale_run") {
+    // 过期 run 的写请求：daemon 没执行，也不能拿 daemon 的计数来比。
+    // 对调用方仍按取消处理，只把 reason 换成 stale_run。
+    runGate.markStale();
+    return { ...payload, ok: false, status: "cancelled", reasonCode: "stale_run" };
   }
   if (payload.status === "cancelled") {
     runGate.observeDaemonCancel(payload.completedSteps);
@@ -724,20 +817,20 @@ class App {
     // space: "screen"(默认) | "window"
     const req = { cmd: "click", app: this.name, ...target };
     if (target.space && !req.space) req.space = target.space;
-    const r = await rpc(req);
+    const r = throwIfCancelled(await rpc(req));
     if (!r.ok) throw new Error(`click failed: ${r.reasonCode || "failed"} ${r.hint || ""}`.trim());
     return r;
   }
 
   async type(text, opts = {}) {
-    const r = await rpc({ cmd: "type", app: this.name, text, ...opts });
+    const r = throwIfCancelled(await rpc({ cmd: "type", app: this.name, text, ...opts }));
     if (!r.ok) throw new Error(`type failed: ${r.reasonCode || "failed"} ${r.hint || ""}`.trim());
     return r;
   }
 
   async key(chord, opts = {}) {
     // 默认定向投递（不抢焦点）。需要真键盘时传 { activate: true }。
-    const r = await rpc({ cmd: "key", app: this.name, key: chord, ...opts });
+    const r = throwIfCancelled(await rpc({ cmd: "key", app: this.name, key: chord, ...opts }));
     if (!r.ok) throw new Error(`key failed: ${r.reasonCode || "failed"} ${r.hint || ""}`.trim());
     return r;
   }
@@ -750,27 +843,27 @@ class App {
    */
   async clickAndWait(target, opts = {}) {
     if (typeof target === "string") target = { ref: target };
-    const r = await rpc({
+    const r = throwIfCancelled(await rpc({
       cmd: "actAndWait", app: this.name, timeoutMs: opts.timeoutMs ?? 1500, ...target,
-    });
+    }));
     if (r.ok === false) throw new Error(`clickAndWait failed: ${r.reasonCode}`);
     return r;
   }
 
   async typeAndWait(text, opts = {}) {
-    const r = await rpc({
+    const r = throwIfCancelled(await rpc({
       cmd: "actAndWait", app: this.name, text, timeoutMs: opts.timeoutMs ?? 1200,
       ...(opts.ref ? { ref: opts.ref } : {}),
-    });
+    }));
     if (r.ok === false) throw new Error(`typeAndWait failed: ${r.reasonCode}`);
     return r;
   }
 
   async keyAndWait(chord, opts = {}) {
-    const r = await rpc({
+    const r = throwIfCancelled(await rpc({
       cmd: "actAndWait", app: this.name, key: chord, timeoutMs: opts.timeoutMs ?? 1500,
       ...(opts.activate ? { activate: true } : {}),
-    });
+    }));
     if (r.ok === false) throw new Error(`keyAndWait failed: ${r.reasonCode}`);
     return r;
   }
@@ -782,7 +875,7 @@ class App {
   }
 
   async set(ref, value) {
-    const r = await rpc({ cmd: "set", app: this.name, ref, value });
+    const r = throwIfCancelled(await rpc({ cmd: "set", app: this.name, ref, value }));
     if (!r.ok) throw new Error(`set failed: ${r.reasonCode}`);
     return r;
   }
@@ -943,6 +1036,7 @@ class App {
         report.status = "cancelled";
         report.cancelled = true;
         report.completedSteps = outcome.completedSteps;
+        if (outcome.reasonCode) report.reasonCode = outcome.reasonCode;
       }
       return report;
     } finally {
@@ -1011,13 +1105,13 @@ class App {
         let what;
         if (typeof step.countGreaterThan === "number") {
           const n0 = step.countGreaterThan;
-          hit = await this.waitFor(
+          hit = await this._pollUntil(
             (elements) => countTextHits(elements, step.text) > n0,
             { timeoutMs: timeout },
           );
           what = `text=${step.text} count>${n0}`;
         } else if (step.window) {
-          hit = await this.waitFor(
+          hit = await this._pollUntil(
             (_, snap) => (snap.window || "").includes(step.window),
             { timeoutMs: timeout },
           );
@@ -1026,11 +1120,10 @@ class App {
           hit = await this._waitForText(step.text, timeout, step.absent === true);
           what = `text=${step.text}`;
         }
+        if (hit === "cancelled") return runGate.stickyResult();
         return hit
           ? { ok: true, verification: { state: "verified", source: "expect " + what } }
-          : runGate.cancelled
-            ? runGate.stickyResult()
-            : { ok: false, reasonCode: "expect_timeout", expect: what };
+          : { ok: false, reasonCode: "expect_timeout", expect: what };
       }
       case "sleep": {
         const t = monoNs();
@@ -1064,27 +1157,30 @@ class App {
   /** 等界面出现/消失某段文字。用轮询替代 sleep(2000)。 */
   async _waitForText(text, timeoutMs, absent) {
     if (!text) return false;
-    return this.waitFor((elements) => {
+    return this._pollUntil((elements) => {
       const hit = elements.some((e) => `${e.label || ""} ${e.value || ""}`.includes(text));
       return hit !== absent;
     }, { timeoutMs });
   }
 
-  /** 等某个条件成立：fn(elements) -> boolean */
-  async waitFor(fn, opts = {}) {
+  /**
+   * 内部轮询：返回 true（命中）/ false（超时）/ "cancelled"（取消或过期）。
+   * act 的 expect 用它，把 cancelled 归一成步骤状态而不是抛出。
+   */
+  async _pollUntil(fn, opts = {}) {
     const timeoutMs = opts.timeoutMs ?? 3000;
     const deadline = monoNs() + BigInt(timeoutMs) * 1_000_000n;
     while (monoNs() < deadline) {
       // 被取消就立刻结束：不睡满超时，也不把这一轮记成 timeout。
-      if (runGate.cancelled) return false;
+      if (runGate.cancelled) return "cancelled";
       const tSnap = monoNs();
       const snap = await rpc({ cmd: "snapshot", app: this.name, max: 4000, actions: false });
       const snapMs = nsToMs(monoNs() - tSnap);
       if (runGate.cancelled) {
-        // 这次快照带回了取消标记：这一轮照常算 wait，但不再判命中、不再等。
+        // 这次快照带回了取消 / 过期标记：这一轮照常算 wait，但不再判命中、不再等。
         const part = attributeWaitPoll(snapMs, 0);
         this._noteWait(part.waitMs, part.snapshots);
-        return false;
+        return "cancelled";
       }
       if (snap.ok !== false && fn(snap.elements || [], snap)) {
         // 命中这一轮没有 sleep，快照本身仍算 wait。
@@ -1097,10 +1193,20 @@ class App {
       await cancellableSleep(80);
       const part = attributeWaitPoll(snapMs, nsToMs(monoNs() - tSleep));
       this._noteWait(part.waitMs, part.snapshots);
-      if (runGate.cancelled) return false;
+      if (runGate.cancelled) return "cancelled";
     }
     this._noteWaitExit("timeout");
     return false;
+  }
+
+  /**
+   * 等某个条件成立：fn(elements) -> boolean。
+   * 脚本里取消 / stale_run 时抛 CancelledError（不再返回 false 让脚本继续跑）。
+   */
+  async waitFor(fn, opts = {}) {
+    const hit = await this._pollUntil(fn, opts);
+    if (hit === "cancelled") throw cancelledError();
+    return hit === true;
   }
 
   /** 截图。走 CLI 的 screencapture 路径，返回文件路径。 */
@@ -1132,14 +1238,18 @@ export const scu = {
     return appCache.get(name);
   },
   async activate(name) {
-    const r = await rpc({ cmd: "activate", app: name });
+    const r = throwIfCancelled(await rpc({ cmd: "activate", app: name }));
     if (!r.ok) throw new Error(`activate failed: ${r.reasonCode}`);
     return r;
   },
   async ping() {
     return rpc({ cmd: "ping" });
   },
-  sleep: (ms) => cancellableSleep(ms, { daemonPoll: true }),
+  /** 可取消的等待。取消 / stale_run 时抛 CancelledError，不返回 undefined 让脚本继续跑。 */
+  async sleep(ms) {
+    await cancellableSleep(ms, { daemonPoll: true });
+    if (runGate.cancelled) throw cancelledError();
+  },
   log: (...a) => console.log(...a),
   countTextHits,
   get rpcCount() {
@@ -1155,6 +1265,7 @@ globalThis.scu = scu;
 /**
  * 每个 scu js 进程启动时调一次，清掉 daemon 里上次运行留下的取消标记。
  * 失败必须抛出：runId 拿不到就没法把写请求绑到本次 run，取消机制会失效。
+ * runId 必须是正整数：Number(null) === 0 / Number("abc") === NaN 都不能当合法值。
  * 调用方（main）捕获后以非 0 退出，不能只打一行 stderr 继续跑脚本。
  */
 async function startRun() {
@@ -1165,9 +1276,10 @@ async function startRun() {
   } catch (err) {
     throw new Error(`begin_run 失败：daemon 不可用（${err?.message || err}）`);
   }
-  const runId = Number(r?.runId);
-  if (!r || r.ok !== true || !Number.isFinite(runId)) {
-    throw new Error(`begin_run 失败：${r?.reasonCode || "bad_response"}`);
+  const runId = r?.runId;
+  if (!r || r.ok !== true || typeof runId !== "number"
+    || !Number.isInteger(runId) || runId <= 0) {
+    throw new Error(`begin_run 失败：${r?.reasonCode || "bad_run_id"}`);
   }
   runGate.runId = runId;
   runGate.completedSteps = Number(r.completedSteps) || 0;
@@ -1204,6 +1316,18 @@ function runningAsCli() {
 
 if (runningAsCli()) {
   main().catch((e) => {
+    if (e && e.name === "CancelledError") {
+      // 脚本里的 waitFor / sleep / 写 API 被取消或 stale_run：给调用方一个
+      // 和 act 同形的终态，退出码 130（不是 1，用来和普通脚本错误区分）。
+      const payload = {
+        ok: false,
+        status: "cancelled",
+        completedSteps: Number(e.completedSteps) || 0,
+      };
+      if (e.reasonCode === "stale_run") payload.reasonCode = "stale_run";
+      process.stdout.write(JSON.stringify(payload) + "\n");
+      process.exit(130);
+    }
     console.error("js error:", e?.message || e);
     process.exit(1);
   });
