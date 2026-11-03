@@ -1238,8 +1238,150 @@ func cachedPress(_ ref: String) -> [String: Any] {
     return ["ok": false, "reasonCode": "no_ax_action", "ref": ref]
 }
 
+// MARK: - 取消
+//
+// daemon 常驻。一个 run 里的取消标记会粘住，直到下一次 begin_run 清掉，
+// 不能漏到下一次 scu js。置位只有 requestCancel()：cancel 命令现在调它，
+// T3 的 Esc 监听在本进程里也调它。
+//
+// 已知限制：socketLoop 是串行的。accept 到一个连接后，handleClient 跑完
+// 才接受下一个。另一个连接发来的 cancel 会排在正在执行的 actAndWait 后面，
+// 只能在两次调用之间生效，进不了它的等待轮询。等待阶段能提前结束，靠的是
+// 同进程另一线程直接调 requestCancel()（T3 的 Esc 监听会这么用）。
+// 所以这里仍要加锁：socket 线程在轮询里读标记，Esc 线程来置位。
+// 锁内只读写 Bool / Int，字典在锁外组装。
+//
+// 写操作在找目标之前先查 runId 过期，再查取消，命中就直接返回、不执行。
+// 带 runId 但不等于当前 runId 的写请求一律回 {ok:false,reasonCode:"stale_run"}：
+// 旧 run 不能越过新 run 的取消/清标记。不带 runId 的单独命令行命令
+// （scu click / scu type ...）既不查过期也不受取消影响。
+// cancel 只对当前 run 生效；只读命令不查、不拦。
+// 投递已经发生才计入 completedSteps，并且只计属于当前 run 的请求。
+// actAndWait 的等待是只读轮询：同进程 requestCancel() 置位后就停，
+// 这一步仍算完成，也不再白等超时。
+
+final class RunCancel {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var runId = 0
+    private var completedSteps = 0
+
+    func beginRun() -> [String: Any] {
+        lock.lock()
+        cancelled = false
+        completedSteps = 0
+        runId += 1
+        let id = runId
+        let steps = completedSteps
+        lock.unlock()
+        return ["ok": true, "runId": id, "completedSteps": steps]
+    }
+
+    /// 置位。不改 completedSteps，不换 runId。可从别的线程调用。
+    func markCancelled() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    /// 只有「带 runId 且等于当前 runId」的请求才受取消影响。
+    /// 不带 runId 的是单独命令行命令（scu click / scu type ...），
+    /// 不能被别的 run 的取消连坐。
+    func isCancelled(runId requestRunId: Int?) -> Bool {
+        guard let requestRunId else { return false }
+        lock.lock()
+        let value = cancelled && requestRunId == runId
+        lock.unlock()
+        return value
+    }
+
+    /// runId 过期：请求带了 runId，但不是当前 run。旧 run 的写请求一律拒绝，
+    /// 免得越过新 run 的取消/清标记。不带 runId 的单独命令行命令不算过期。
+    func isStaleRun(runId requestRunId: Int?) -> Bool {
+        guard let requestRunId else { return false }
+        lock.lock()
+        let current = runId
+        lock.unlock()
+        return requestRunId != current
+    }
+
+    /// 投递已经发生。等待阶段被取消时这一步也算完成。
+    /// 只给属于当前 run 的请求计数，别的 run / 单独命令不污染本次的 completedSteps。
+    func noteDelivered(runId requestRunId: Int?) {
+        lock.lock()
+        if let requestRunId, requestRunId == runId { completedSteps += 1 }
+        lock.unlock()
+    }
+
+    /// 取消响应。等待阶段被打断时带上 actMs / waitedMs，
+    /// 让调用方能在 trace 里写出 wait_exit=cancelled 的分段。
+    func cancelledResponse(waitedMs: Int? = nil, actMs: Int? = nil) -> [String: Any] {
+        lock.lock()
+        let steps = completedSteps
+        lock.unlock()
+        var out: [String: Any] = [
+            "ok": false,
+            "status": "cancelled",
+            "completedSteps": steps,
+        ]
+        if let waitedMs { out["waitedMs"] = waitedMs }
+        if let actMs { out["actMs"] = actMs }
+        return out
+    }
+
+    /// 已取消则返回要直接回给调用方的结果；否则 nil，调用方继续找目标。
+    /// 只拦属于当前 run 的写请求。
+    func guardNotCancelled(runId: Int?) -> [String: Any]? {
+        guard isCancelled(runId: runId) else { return nil }
+        return cancelledResponse()
+    }
+
+    /// 过期 runId 的写请求的固定响应。不执行，不记 trace，不改任何计数。
+    func staleResponse() -> [String: Any] {
+        ["ok": false, "reasonCode": "stale_run"]
+    }
+}
+
+let runCancel = RunCancel()
+
+/// cancel 命令和以后的 Esc 监听都调这个函数。
+@discardableResult
+func requestCancel() -> [String: Any] {
+    runCancel.markCancelled()
+    return runCancel.cancelledResponse()
+}
+
+/// 无锁全局变量：只在串行的 socketLoop 线程上写（socketLoop -> handleClient），
+/// 一个请求处理完才接下一个，所以不需要加锁，也不跟别的线程抢。
+/// 前提是 socketLoop 串行处理请求；一旦改成并发处理，这两个变量必须改成按请求传参。
+/// click/set/type/key/scroll 的成功响应在 writeLine 里记一笔已投递；
+/// actAndWait 自己进入等待时记账，不走这个开关。
+var countWriteDelivery = false
+/// 上面这次写的请求属于哪个 run。nil = 单独命令行命令，不参与任何 run 的计数。
+var countWriteRunId: Int?
+/// 当前请求带的 runId。只读响应靠它带回 runCancelled / runStale 标记，
+/// 让调用方的等待轮询知道「本 run 已被取消」或「这个 runId 已过期」，
+/// 同时请求本身照常执行、不算被拦。
+var currentRequestRunId: Int?
+
 func writeLine(_ fd: Int32, _ obj: [String: Any]) {
-    if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) {
+    if countWriteDelivery,
+       (obj["ok"] as? Bool) == true,
+       (obj["status"] as? String) != "cancelled" {
+        runCancel.noteDelivered(runId: countWriteRunId)
+    }
+    var out = obj
+    // 只读命令不拦，但把 run 状态捎回去：跨进程的 cancel 只会在两次请求之间生效，
+    // 等待轮询（JS 的 waitFor / expect / sleep）靠这两个字段提前结束。
+    // runStale = 这个 runId 已经不是当前 run；runCancelled = 当前 run 被取消了。
+    if let requestId = currentRequestRunId {
+        if runCancel.isStaleRun(runId: requestId) {
+            out["runStale"] = true
+        } else if runCancel.isCancelled(runId: requestId) {
+            out["runCancelled"] = true
+        }
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) {
         var payload = data
         payload.append(0x0A)
         payload.withUnsafeBytes { buf in
@@ -1376,6 +1518,8 @@ final class StepTrace {
 /// 执行一个动作，然后轮询直到界面变化（或超时）。
 /// 这是替代"动作后截图给模型看"的关键原语：一次遍历 30–120ms，比一次视觉判断快一个数量级。
 func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [String: Any] {
+    // 只有属于当前 run 的请求才响应取消；单独命令行调用 runId 为 nil。
+    let requestRunId = req["runId"] as? Int
     let tr = StepTrace()
     tr.action = traceAction(req)
 
@@ -1534,13 +1678,35 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     // ---- 等变化 ----
     // 动作分支里还没归类的缝隙算进 deliver，避免漏进 wait。
     tr.deliverMs += tr.take()
-    let actMs = Int(Date().timeIntervalSince(tActStart) * 1000)
+    // 只有投递成功才计入。失败的 AX 动作如果后来因界面变化被升级成 ok，
+    // 在函数末尾补记一次，避免和 JS 侧“ok 才算 daemon 写步”对不上。
+    var countedDelivery = false
+    if (actResult["ok"] as? Bool) == true {
+        runCancel.noteDelivered(runId: requestRunId)
+        countedDelivery = true
+    }
     let started = Date()
+    let actMs = Int(started.timeIntervalSince(tActStart) * 1000)
+    // 取消落在只读轮询里：不再睡满 timeout。已投递的这一步保持计入，
+    // 并带上 actMs / waitedMs，让调用方记一行 wait_exit=cancelled 的 trace。
+    func cancelledInWait() -> [String: Any] {
+        let waited = Int(Date().timeIntervalSince(started) * 1000)
+        return runCancel.cancelledResponse(waitedMs: waited, actMs: actMs)
+    }
+    if runCancel.isCancelled(runId: requestRunId) {
+        return cancelledInWait()
+    }
     var changed = false
     var waited = 0
     while waited < timeoutMs {
+        if runCancel.isCancelled(runId: requestRunId) {
+            return cancelledInWait()
+        }
         usleep(45_000)
         waited = Int(Date().timeIntervalSince(started) * 1000)
+        if runCancel.isCancelled(runId: requestRunId) {
+            return cancelledInWait()
+        }
         guard let now = snap(actions: false) else { continue }
         if signature(now) != sigBefore {
             changed = true
@@ -1566,6 +1732,9 @@ func actAndWait(_ req: [String: Any], appSpec: String, timeoutMs: Int) -> [Strin
     out["verification"] = combineVerification(out["verification"] as? [String: Any], changed: changed)
     tr.verifyMs += tr.take()
     if !changed { out["note"] = "界面没有变化：动作可能没生效，或者这个动作本来就不改界面" }
+    if !countedDelivery, (out["ok"] as? Bool) == true {
+        runCancel.noteDelivered(runId: requestRunId)
+    }
     return tr.finish(out)
 }
 
@@ -1599,6 +1768,32 @@ func handleClient(_ fd: Int32) {
     }
     let cmd = req["cmd"] as? String ?? ""
     let appSpec = req["app"] as? String ?? ""
+    // scu js 的写 RPC 带 runId。单独的命令行命令不带，从入口就不受任何取消影响。
+    let requestRunId = req["runId"] as? Int
+
+    // 写操作在找目标之前先查 runId 过期，再查取消。命中就直接返回，不快照、不投递。
+    // 只拦属于当前 run 的请求；snapshot / ping / signature 等只读命令不在这张表里。
+    // paste 没有对应命令分支，不再列进来；activate 会换前台应用，要跟着拦。
+    let writeDeliveryCmds: Set<String> = ["click", "set", "type", "key", "scroll"]
+    let guardedCmds = writeDeliveryCmds.union(["act", "actAndWait", "activate"])
+    if guardedCmds.contains(cmd) {
+        if runCancel.isStaleRun(runId: requestRunId) {
+            writeLine(fd, runCancel.staleResponse())
+            return
+        }
+        if let denied = runCancel.guardNotCancelled(runId: requestRunId) {
+            writeLine(fd, denied)
+            return
+        }
+    }
+    countWriteDelivery = writeDeliveryCmds.contains(cmd)
+    countWriteRunId = requestRunId
+    currentRequestRunId = requestRunId
+    defer {
+        countWriteDelivery = false
+        countWriteRunId = nil
+        currentRequestRunId = nil
+    }
 
     // 只有写动作上 HUD；snapshot/ping 之类不弹，否则屏幕会一直闪。
     let hudWorthy = ["click", "set", "type", "key", "scroll", "actAndWait"].contains(cmd)
@@ -1610,6 +1805,14 @@ func handleClient(_ fd: Int32) {
     switch cmd {
     case "ping":
         writeLine(fd, ["ok": true, "pid": getpid(), "cached": cache.count, "app": cacheApp])
+
+    case "begin_run":
+        // 新 run：清标记、换 runId、已完成步数归零。scu js 进程启动时调一次。
+        writeLine(fd, runCancel.beginRun())
+
+    case "cancel":
+        // 置位后只对当前 runId 生效；别的 run 的写请求本来就会因 stale_run 被拒。
+        writeLine(fd, requestCancel())
 
     case "snapshot":
         let maxN = req["max"] as? Int ?? 4000
@@ -1893,6 +2096,9 @@ func socketLoop(path: String) -> Never {
 
 func serveDaemon(path: String) -> Never {
     // SCU_HUD=0（CI / 无 WindowServer）时保持纯后台，不起 AppKit。
+    // 这个模式下 socketLoop 直接占主线程，没有 AppKit runloop，进程内的 Esc
+    // 监听起不来：取消只能在两次调用之间生效，进不了正在跑的 actAndWait 等待轮询。
+    // 要能在等待中途按 Esc 取消，必须开着 HUD（有 runloop）。
     guard ProcessInfo.processInfo.environment["SCU_HUD"] != "0" else {
         socketLoop(path: path)
     }
