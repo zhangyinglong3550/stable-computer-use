@@ -385,8 +385,28 @@ python3 bench/run.py --runs 10
 
 `resolve_ms` 是找目标的时间，包括取快照和定位，`actAndWait` 动作前那次轻量快照（`wait_before`）记在这里。`deliver_ms` 是把动作投递出去的时间。`wait_ms` 是等到界面变化或超时的整段时间，轮询快照和中间的等待都算在里面。`verify_ms` 是校验写入或核对结果的时间。
 
-取消与 `wait_exit` 的关系：一步的动作已经投递、取消打断的是这一步的等待时，该步算已完成（`completedSteps` 包含它），照常输出一行 trace，`wait_exit` 记 `cancelled`。取消发生在某步动作送出之前时，该步不执行，不输出 trace，不计入 `completedSteps`，也不算超时。
+取消与 `wait_exit` 的关系：一步的动作已经投递、取消打断的是这一步的等待时，该步算已完成（`completedSteps` 包含它），照常输出一行 trace，`wait_exit` 记 `cancelled`。取消发生在某步动作送出之前时，该步不执行，不输出 trace，不计入 `completedSteps`，也不算超时。`completedSteps` 和 trace 只按 daemon 确认的写投递计数：JS 本地拦下的结果（带 `local:true`）不参与 daemon 计数比较。
 
-`cancel` 对跨进程的调用方只在两次请求之间生效。为了不让 `expect` 的轮询白等到超时，daemon 对带 `runId` 且该 run 已取消的**只读**请求照常执行、照常返回结果，只在响应上多带一个 `runCancelled: true`。JS 侧据此停止等待，返回 `status: "cancelled"`，不记成 `expect_timeout`。
+### runId 判定表
+
+写请求（`click` / `set` / `type` / `key` / `scroll` / `act` / `actAndWait` / `activate`）在找目标之前按 `runId` 判定；只读请求（`snapshot` / `ping`）不拦，只带标记。
+
+| 请求 | runId | daemon 行为 | 响应 |
+|---|---|---|---|
+| 单独命令行写命令 | 不带 | 正常执行 | 正常结果 |
+| 写命令 | 等于当前 runId，当前 run 未取消 | 正常执行 | 正常结果 |
+| 写命令 | 等于当前 runId，当前 run 已取消 | 不执行 | `{"ok":false,"status":"cancelled","completedSteps":n}` |
+| 写命令 | 不等于当前 runId（过期） | 不执行 | `{"ok":false,"reasonCode":"stale_run"}` |
+| 只读请求 | 不带 / 等于当前未取消 | 正常执行 | 正常结果 |
+| 只读请求 | 等于当前 runId，当前 run 已取消 | 正常执行 | 正常结果 + `runCancelled:true` |
+| 只读请求 | 不等于当前 runId（过期） | 正常执行 | 正常结果 + `runStale:true` |
+
+`socketLoop` 串行处理请求，`begin_run` 换号只能发生在两次请求之间，所以一次 `actAndWait` 内部的 runId 不会中途变化，入口判定即可覆盖它的整个等待循环。
+
+取消的 `reason`（`reasonCode`）只有两个取值：`cancelled`（当前 run 被取消）和 `stale_run`（runId 过期）。两者在结果里的 `status` 都是 `"cancelled"`，不新增别的 status；`stale_run` 不参与 `completedSteps` 计数，因为 daemon 根本没执行。
+
+`cancel` 对跨进程的调用方只在两次请求之间生效。为了不让 `expect` 的轮询白等到超时，daemon 对带 `runId` 的**只读**请求照常执行、照常返回结果，只在响应上多带 `runCancelled` / `runStale`。JS 侧据此停止等待：`act` 内返回 `status: "cancelled"`，不记成 `expect_timeout`。
+
+脚本级 API 的取消统一抛 `CancelledError`：`scu.waitFor`、`scu.sleep` 和每个写 API（含 `scu.activate`）在发现 `cancelled` / `stale_run` 时抛出，不再返回 `false` / `undefined` 让脚本继续跑。`scu js` 顶层捕获后向 stdout 输出 `{"ok":false,"status":"cancelled","completedSteps":n}`（`stale_run` 时多带 `reasonCode`），退出码 `130`。普通脚本错误仍是 stderr + 退出码 `1`，参数错误退出码 `2`。`act()` 不抛，仍按上面的结果契约返回 `status: "cancelled"`。
 
 降级：`SCU_HUD=0`（CI / 无 WindowServer）时 daemon 退出 AppKit、socket 循环直接占用主线程，进程内的 Esc 监听没有 runloop 可跑。这种模式下只剩「调用之间的取消」：另一个连接发来的 `cancel` 排在正在执行的 `actAndWait` 之后，只能在两次 RPC 之间生效，进不了它的等待轮询。等待阶段能被提前打断，依赖同进程另一线程调用 `requestCancel()`（HUD 开着时的 Esc 监听就是这么用的）。

@@ -354,8 +354,9 @@ class TestCodeMode(unittest.TestCase):
             'for (let i=0;i<5;i++) await a.state();\n'
             'console.log("rpc=" + scu.rpcCount);')
         self.assertEqual(code, 0, err)
-        # 1 次 getApp + 5 次 state
-        self.assertIn("rpc=6", out)
+        # 1 次 begin_run（scu js 启动时握手）+ 1 次 getApp + 5 次 state。
+        # begin_run 从 PR #4 起也走 rpc，这里按实际次数断言。
+        self.assertIn("rpc=7", out)
 
     def test_unknown_app_raises(self):
         out, err, code = self._js(

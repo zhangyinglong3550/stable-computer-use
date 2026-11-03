@@ -13,8 +13,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  CancelRun, carriesRunId, composeStepTrace, fallbackFromActResult, gateRpc, isWriteCmd,
-  runActSteps, withRunId,
+  CancelRun, CancelledError, carriesRunId, composeStepTrace, fallbackFromActResult, gateRpc,
+  isGuardedCmd, isWriteCmd, runActSteps, withRunId,
 } from "../cli/jsapi.mjs";
 
 /** 按给定次数执行，返回记录到的 op 列表。 */
@@ -161,12 +161,15 @@ test("写命令、snapshot、ping 带 runId；begin_run / cancel / signature 不
     assert.equal(req.cmd, cmd);
     assert.equal(req.app, "Finder");
   }
-  // snapshot / ping 带 runId 只为接收 runCancelled，不是写命令。
-  for (const cmd of ["snapshot", "ping"]) {
+  // snapshot / ping 带 runId 只为接收 runCancelled / runStale；activate 是 guarded 但不计投递。
+  for (const cmd of ["snapshot", "ping", "activate"]) {
     assert.equal(isWriteCmd(cmd), false, cmd);
     assert.equal(carriesRunId(cmd), true, cmd);
     assert.equal(withRunId({ cmd }, runId).runId, runId, cmd);
   }
+  assert.equal(isGuardedCmd("activate"), true);
+  assert.equal(isGuardedCmd("snapshot"), false);
+  assert.equal(isGuardedCmd("click"), true);
   for (const cmd of ["signature", "begin_run", "cancel"]) {
     assert.equal(isWriteCmd(cmd), false, cmd);
     assert.equal("runId" in withRunId({ cmd }, runId), false, cmd);
@@ -231,11 +234,12 @@ test("投递之前被取消：写命令不发往 daemon，也不进 completedSte
   gate.noteStepCompleted();
   gate.cancel();
 
-  for (const cmd of ["click", "set", "type", "key", "scroll", "paste", "act", "actAndWait"]) {
+  for (const cmd of ["click", "set", "type", "key", "scroll", "paste", "act", "actAndWait", "activate"]) {
     const adm = gateRpc(gate, cmd);
     assert.equal(adm.send, false, cmd);
     assert.equal(adm.result.status, "cancelled");
     assert.equal(adm.result.completedSteps, 1);
+    assert.equal(adm.result.local, true, cmd);
   }
   for (const cmd of ["snapshot", "state", "ping", "signature"]) {
     assert.equal(gateRpc(gate, cmd).send, true, cmd);
@@ -247,4 +251,135 @@ test("投递之前被取消：写命令不发往 daemon，也不进 completedSte
   });
   assert.equal(out.completedSteps, 1);
   assert.deepEqual(out.traceSteps, []);
+});
+
+// ---------------- 阻塞 B：completedSteps / trace 只认 daemon 确认的投递 ----------------
+
+test("阻塞 B 复现（评审原文）：前面是成功的 expect，后面写步在本地被拦不算已投递", async () => {
+  const gate = new CancelRun();
+  gate.beginRun();
+
+  const out = await runActSteps([{ op: "expect" }, { op: "click" }], gate, {
+    exec(_step, i, g) {
+      if (i === 0) return { ok: true };
+      g.cancel();
+      return g.stickyResult();
+    },
+  });
+
+  assert.equal(out.status, "cancelled");
+  // expect 完成算 1 步；被本地拦下的 click 没有投递，不能再算。
+  assert.equal(out.completedSteps, 1);
+  assert.deepEqual(out.traceSteps.map((t) => t.step), [0]);
+  assert.equal(gate.seenDaemon, 0);
+  assert.equal(out.steps[1].reasonCode, "cancelled");
+});
+
+test("阻塞 B 情形一：前面是成功的 sleep，后面写步本地被拦不算已投递", async () => {
+  const gate = new CancelRun();
+  gate.beginRun();
+  const ran = [];
+
+  const out = await runActSteps([{ op: "sleep" }, { op: "click" }], gate, {
+    exec(step, i, g) {
+      ran.push(step.op);
+      if (i === 0) return { ok: true };
+      g.cancel();
+      return g.stickyResult();
+    },
+  });
+
+  assert.deepEqual(ran, ["sleep", "click"]);
+  assert.equal(out.completedSteps, 1);
+  assert.deepEqual(out.traceSteps.map((t) => t.step), [0]);
+  assert.equal(gate.seenDaemon, 0);
+});
+
+test("阻塞 B 情形二：已投递的 click 后接被取消的 sleep，不再多算一步或一行 trace", async () => {
+  const gate = new CancelRun();
+  gate.beginRun();
+
+  const out = await runActSteps([{ op: "click" }, { op: "sleep" }], gate, {
+    exec(_step, i, g) {
+      if (i === 0) {
+        g.noteWriteOk();
+        return { ok: true, via: "ax", changed: true };
+      }
+      g.cancel();
+      return g.stickyResult();
+    },
+  });
+
+  assert.equal(out.completedSteps, 1);
+  assert.deepEqual(out.traceSteps.map((t) => t.step), [0]);
+  assert.equal(gate.seenDaemon, 1);
+  assert.equal(out.steps[1].reasonCode, "cancelled");
+});
+
+// ---------------- 阻塞 A：过期 runId ----------------
+
+test("过期 run 的写按 cancelled 承载 stale_run，不计数、不出 trace，后续写本地拦住", async () => {
+  const gate = new CancelRun();
+  gate.beginRun();
+
+  const out = await runActSteps([{ op: "expect" }, { op: "click" }, { op: "type" }], gate, {
+    exec(_step, i) {
+      if (i === 0) return { ok: true };
+      // daemon 对过期 runId 的固定响应：不执行。
+      return { ok: false, reasonCode: "stale_run" };
+    },
+  });
+
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "cancelled");
+  assert.equal(out.reasonCode, "stale_run");
+  assert.equal(out.cancelled, true);
+  // expect 完成的 1 步保留；过期的写没有执行，不能算。
+  assert.equal(out.completedSteps, 1);
+  assert.equal(gate.seenDaemon, 0);
+  assert.deepEqual(out.traceSteps.map((t) => t.step), [0]);
+  assert.deepEqual(out.steps.map((s) => s.reasonCode), [undefined, "stale_run", "stale_run"]);
+
+  // 同一 run 内保持：后续写不再发往 daemon，reason 仍是 stale_run。
+  const adm = gateRpc(gate, "click");
+  assert.equal(adm.send, false);
+  assert.equal(adm.result.status, "cancelled");
+  assert.equal(adm.result.reasonCode, "stale_run");
+  assert.equal(adm.result.completedSteps, 1);
+  // 本地拦下的结果带 local 标记，runActSteps 不会拿它去撞 daemon 计数。
+  assert.equal(adm.result.local, true);
+});
+
+test("stale 状态的新 run 会清掉过期标记", () => {
+  const gate = new CancelRun();
+  gate.beginRun();
+  gate.markStale();
+  assert.equal(gate.cancelled, true);
+  assert.equal(gate.stale, true);
+  assert.equal(gate.stickyResult().reasonCode, "stale_run");
+
+  const started = gate.beginRun();
+  assert.equal(started.runId, 2);
+  assert.equal(gate.cancelled, false);
+  assert.equal(gate.stale, false);
+  assert.equal(gate.stickyResult().reasonCode, "cancelled");
+  assert.equal(gateRpc(gate, "click").send, true);
+});
+
+test("CancelledError 携带 status / reasonCode / completedSteps", () => {
+  const gate = new CancelRun();
+  gate.beginRun();
+  gate.noteStepCompleted();
+  const plain = new CancelledError({ completedSteps: gate.completedSteps });
+  assert.equal(plain.name, "CancelledError");
+  assert.equal(plain.status, "cancelled");
+  assert.equal(plain.ok, false);
+  assert.equal(plain.reasonCode, "cancelled");
+  assert.equal(plain.completedSteps, 1);
+  assert.ok(plain instanceof Error);
+
+  const stale = new CancelledError({ reasonCode: "stale_run", completedSteps: 2 });
+  assert.equal(stale.status, "cancelled");
+  assert.equal(stale.reasonCode, "stale_run");
+  assert.equal(stale.completedSteps, 2);
 });
