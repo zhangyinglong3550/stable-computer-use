@@ -147,6 +147,14 @@ def _print_wechat(report: dict, runs: list[dict], session: str, text: str) -> No
     n = report["runs"]
     ok = report["successes"]
     rate = report["success_rate"]
+    has_target = any(
+        isinstance(ev, dict) and ev.get("target")
+        for run in runs
+        for ev in (run.get("events") or [])
+    )
+    if has_target:
+        print("提醒：本报告含 target（文字点击命中的节点名，可能是会话名或消息文字，"
+              "含用户界面上的文字，来自 stderr）。贴到群里、报告或 issue 之前要先检查并脱敏。")
     print(f"发送对象：{session}")
     print(f"文字：{text}")
     print(f"### 微信基线（{session} · {text}） n={n}\n")
