@@ -1246,10 +1246,15 @@ func cachedPress(_ ref: String) -> [String: Any] {
 //
 // 已知限制：socketLoop 是串行的。accept 到一个连接后，handleClient 跑完
 // 才接受下一个。另一个连接发来的 cancel 会排在正在执行的 actAndWait 后面，
-// 只能在两次调用之间生效，进不了它的等待轮询。等待阶段能提前结束，靠的是
-// 同进程另一线程直接调 requestCancel()（T3 的 Esc 监听会这么用）。
-// 所以这里仍要加锁：socket 线程在轮询里读标记，Esc 线程来置位。
-// 锁内只读写 Bool / Int，字典在锁外组装。
+// 只能在两次调用之间生效，进不了它的等待轮询。
+//
+// T3：Esc 监听必须在本进程内直接调 requestCancel()，不能另起进程再发 socket cancel。
+// socket 上的 cancel 只有带了当前 runId 才置位；缺 runId 或对不上（晚到的旧 run）
+// 不改标记，避免把新 run 取消掉。requestCancel() 本身不看参数，取消的就是当前 run。
+// 等待阶段能提前结束，靠的就是这个进程内调用。锁内只读写 Bool / Int，字典在锁外组装。
+//
+// 降级：SCU_HUD=0 时 serveDaemon 在主线程跑 socketLoop，没有 runloop，
+// Esc 监听跑不起来，只剩「这次调用返回之后，下一次调用才看得见取消」。
 //
 // 写操作在找目标之前先查 runId 过期，再查取消，命中就直接返回、不执行。
 // 带 runId 但不等于当前 runId 的写请求一律回 {ok:false,reasonCode:"stale_run"}：
@@ -1340,6 +1345,30 @@ final class RunCancel {
     func staleResponse() -> [String: Any] {
         ["ok": false, "reasonCode": "stale_run"]
     }
+
+    /// socket cancel。只有 requested 等于当前 runId 才置位。
+    /// nil 或对不上都不改 cancelled。进程内 Esc 不走这里，直接 requestCancel()。
+    func cancelIfCurrent(requestedRunId: Int?) -> [String: Any] {
+        lock.lock()
+        let current = runId
+        let steps = completedSteps
+        let matches = requestedRunId == current
+        if matches { cancelled = true }
+        lock.unlock()
+        if !matches {
+            return [
+                "ok": false,
+                "status": "ignored",
+                "reasonCode": "run_mismatch",
+                "runId": current,
+            ]
+        }
+        return [
+            "ok": false,
+            "status": "cancelled",
+            "completedSteps": steps,
+        ]
+    }
 }
 
 let runCancel = RunCancel()
@@ -1353,7 +1382,8 @@ func requestCancel() -> [String: Any] {
 
 /// 无锁全局变量：只在串行的 socketLoop 线程上写（socketLoop -> handleClient），
 /// 一个请求处理完才接下一个，所以不需要加锁，也不跟别的线程抢。
-/// 前提是 socketLoop 串行处理请求；一旦改成并发处理，这两个变量必须改成按请求传参。
+/// 前提是 socket 循环串行。以后如果改成每个连接一个线程，这两个变量和
+/// completedSteps 的计数要一起重新设计，不能只给其中一个加锁。
 /// click/set/type/key/scroll 的成功响应在 writeLine 里记一笔已投递；
 /// actAndWait 自己进入等待时记账，不走这个开关。
 var countWriteDelivery = false
@@ -1811,8 +1841,9 @@ func handleClient(_ fd: Int32) {
         writeLine(fd, runCancel.beginRun())
 
     case "cancel":
-        // 置位后只对当前 runId 生效；别的 run 的写请求本来就会因 stale_run 被拒。
-        writeLine(fd, requestCancel())
+        // 必须带当前 runId。晚到的旧 run、以及不带 runId 的 cancel，都不置位。
+        // 进程内 Esc 不走这条，直接调 requestCancel()。
+        writeLine(fd, runCancel.cancelIfCurrent(requestedRunId: requestRunId))
 
     case "snapshot":
         let maxN = req["max"] as? Int ?? 4000

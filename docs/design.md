@@ -441,4 +441,4 @@ python3 bench/run.py --runs 10
 
 脚本级 API 的取消统一抛 `CancelledError`：`scu.waitFor`、`scu.sleep` 和每个写 API（含 `scu.activate`）在发现 `cancelled` / `stale_run` 时抛出，不再返回 `false` / `undefined` 让脚本继续跑。`scu js` 顶层捕获后向 stdout 输出 `{"ok":false,"status":"cancelled","completedSteps":n}`（`stale_run` 时多带 `reasonCode`），退出码 `130`。普通脚本错误仍是 stderr + 退出码 `1`，参数错误退出码 `2`。`act()` 不抛，仍按上面的结果契约返回 `status: "cancelled"`。
 
-降级：`SCU_HUD=0`（CI / 无 WindowServer）时 daemon 退出 AppKit、socket 循环直接占用主线程，进程内的 Esc 监听没有 runloop 可跑。这种模式下只剩「调用之间的取消」：另一个连接发来的 `cancel` 排在正在执行的 `actAndWait` 之后，只能在两次 RPC 之间生效，进不了它的等待轮询。等待阶段能被提前打断，依赖同进程另一线程调用 `requestCancel()`（HUD 开着时的 Esc 监听就是这么用的）。
+降级：`SCU_HUD=0`（CI / 无 WindowServer）时 daemon 退出 AppKit、socket 循环直接占用主线程，进程内的 Esc 监听没有 runloop 可跑。这种模式下只剩「调用之间的取消」：另一个连接发来的 `cancel` 排在正在执行的 `actAndWait` 之后，只能在两次 RPC 之间生效，进不了它的等待轮询。等待阶段能被提前打断，依赖同进程另一线程调用 `requestCancel()`（HUD 开着时的 Esc 监听就是这么用的）。Esc 监听必须留在 daemon 进程里，不能做成单独进程再发 socket `cancel`。socket 上的 `cancel` 只有带了当前 `runId` 才置位；缺 `runId` 或对不上当前 run 时不改标记（`reasonCode: "run_mismatch"`），避免晚到的旧 run 把新 run 取消掉。

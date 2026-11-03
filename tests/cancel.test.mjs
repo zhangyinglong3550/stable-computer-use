@@ -13,8 +13,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  CancelRun, CancelledError, carriesRunId, composeStepTrace, fallbackFromActResult, gateRpc,
-  isGuardedCmd, isWriteCmd, runActSteps, withRunId,
+  CancelRun, CancelledError, cancelAppliesToRun, carriesRunId, composeStepTrace,
+  fallbackFromActResult, gateRpc, isGuardedCmd, isWriteCmd, runActSteps, withRunId,
 } from "../cli/jsapi.mjs";
 
 /** 按给定次数执行，返回记录到的 op 列表。 */
@@ -382,4 +382,16 @@ test("CancelledError 携带 status / reasonCode / completedSteps", () => {
   assert.equal(stale.status, "cancelled");
   assert.equal(stale.reasonCode, "stale_run");
   assert.equal(stale.completedSteps, 2);
+});
+
+test("runId 不匹配或缺失的 cancel 不取消当前 run", () => {
+  assert.equal(cancelAppliesToRun(7, 7), true);
+  assert.equal(cancelAppliesToRun(6, 7), false);
+  assert.equal(cancelAppliesToRun(undefined, 7), false);
+  assert.equal(cancelAppliesToRun(null, 7), false);
+  assert.equal(cancelAppliesToRun(7.5, 7), false);
+  // 不带 runId 的命令行写请求不盖戳，daemon 不会把它算进任何一个 run。
+  const bare = { cmd: "click", app: "Finder" };
+  assert.equal(withRunId(bare, undefined), bare);
+  assert.equal("runId" in withRunId({ cmd: "type", app: "Finder" }, undefined), false);
 });

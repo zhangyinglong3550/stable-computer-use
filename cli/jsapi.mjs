@@ -277,6 +277,18 @@ export function carriesRunId(cmd) {
 }
 
 /**
+ * socket 上的 cancel 是否该置位。只有请求里的 runId 等于当前 run 才生效。
+ * 缺 runId 或对不上都不置位，避免晚到的旧 run 取消新 run。
+ * 进程内 Esc 不走这个判断，直接 requestCancel()，取消的就是当前 run。
+ * 与 Swift `RunCancel.cancelIfCurrent(requestedRunId:)` 同一条规则。
+ */
+export function cancelAppliesToRun(requestRunId, currentRunId) {
+  if (typeof requestRunId !== "number" || typeof currentRunId !== "number") return false;
+  if (!Number.isInteger(requestRunId) || !Number.isInteger(currentRunId)) return false;
+  return requestRunId === currentRunId;
+}
+
+/**
  * 写命令带上当前 runId，daemon 只执行「带 runId 且等于当前 runId」的写请求，
  * runId 过期回 stale_run，当前 run 被取消回 cancelled。
  * snapshot / ping 也带，用来接收只读响应里的 runCancelled / runStale 标记。
