@@ -179,7 +179,9 @@ handoff → 返回候选表，交回调用方                    0 成本
 
 这是整个项目最重要的设计约束 —— **用户正在用电脑时，Agent 不能和他抢**。
 
-### 9.1 先说 Codex 怎么做的（拆二进制得到的事实）
+### 9.1 Codex 是否合成键鼠事件（待核实）
+
+提交 [`ec4c352`](https://github.com/zhangyinglong3550/stable-computer-use/commit/ec4c352)（2026-10-27 16:33，北京时间）拆二进制时，观察到的导入符号是：
 
 ```
 SkyComputerUseService 导入符号：
@@ -191,9 +193,23 @@ SkyComputerUseService 导入符号：
   ✗ 没有 IOHIDPostEvent
 ```
 
-整个 CUA 包、`codex` 主程序、ChatGPT 主程序都查过，一处都没有。
-**它不合成鼠标键盘事件，全部通过无障碍动作完成。** 这就是"不占桌面"的真正原因 ——
-它压根不碰桌面那一层，而不是"占得比较少"。
+整个 CUA 包、`codex` 主程序、ChatGPT 主程序当时都查过，这几处都没有上述三个投递符号。仓库没有记录拆的是哪个版本。上一个提交 `8266604` 里还没有这段观察。
+
+**待核实，不要把上面写成结论。** 「没有这几个导入符号」推不出「不合成鼠标键盘事件、全部通过无障碍动作完成」：事件可以走 NSEvent 转换或私有接口投递。官方来源查不到。OpenAI 博客和 ChatGPT Learn 文档只说用自己的光标看、点、打字，以及可以和剪贴板交互，没有说明底层是 AX 动作还是合成事件。
+
+**说法 A（本仓库）**
+
+- 提交 [`ec4c352`](https://github.com/zhangyinglong3550/stable-computer-use/commit/ec4c352)，2026-10-27 16:33（北京时间）。
+- 内容就是上面的符号观察：没有 `CGEventPost` / `CGEventPostToPid` / `IOHIDPostEvent`，有 AX 动作相关符号。
+
+**说法 B（第三方逆向，都不是官方）**
+
+- [waku 文档](https://github.com/egoist/waku/blob/6d433e87/docs/sky-macos-accessibility-reverse-engineering.md)：分析 `@oai/sky` 0.6.2，服务版本 26.727.1000550。文档首次提交 2026-08-04（北京时间）；链接固定在 `6d433e87`，那次提交是 2026-08-12（北京时间）。说法是坐标点击先构造 NSEvent，再转成 CGEvent，带上窗口 ID，「posted directly to the target PID」；键盘通过 `SynthesizedEvent` 生成按 PID 投递的事件；后台焦点靠 `SyntheticAppFocusEnforcer` 加 event tap。作者自己标注这部分是「语义重建，不是源码」，具体用哪个投递函数没有写明。
+- [paralym/codex-computer-use-cli](https://github.com/paralym/codex-computer-use-cli)：README 日期 2026-05-02。同时写了「没有 `CGEventPost` 符号」和「用 `SyntheticAppFocusEnforcer`、`NSEvent.mouseEvent(windowNumber:)` 做可信投递」。
+- [vtomnet 的字符串分析](https://github.com/vtomnet/codex-cua-tea/blob/main/SkyComputerUseService.md)：2026-04-17。说它 “uses event taps and synthetic CGEvent input”。
+- [openai/codex issue #53861](https://github.com/openai/codex/issues/53861)：用户在 2026-10-14（北京时间）提交，作者标记为 NONE，不是 OpenAI 员工。报告说 `CGGetEventTapList` 显示 SkyComputerUseService 持有 3–5 个按进程的键盘 tap，二进制里有 `keyboardEventTap`、`SystemFocusStealPreventer`。
+
+复查办法：在 Mac 上对当前安装的服务版本用 `nm` / `otool` 复查导入符号；在 Codex 执行后台操作时用 `CGGetEventTapList` 看它有没有装 event tap。核实之前，符号观察只是观察。
 
 ### 9.2 三层策略
 
@@ -282,6 +298,21 @@ Agent 总能等到空隙。
 副作用（好的）：daemon 有 runloop 之后，`NSWorkspace` 的 app 列表通知也正常了。
 不过 `sysctl` 兜底仍然保留 —— `SCU_HUD=0` 时 daemon 是纯后台进程，没有 runloop。
 
+上面第 1 点「浮窗不需要 TCC」只描述**已经在跑**的这条纯展示状态条。下面的 Esc 监听是另一项权限，而且还没做。
+
+### 9.8 计划中：Codex 式小窗口与 Esc 取消（尚未实现）
+
+计划把操作时的状态条换成 Codex 式小窗口，显示「正在操作你的电脑 · 按 Esc 取消」。Esc 用全局键盘监听，需要 macOS 的「输入监控」权限。**这是计划中 / 即将加入的行为，当前代码没有实现，不要当成现有功能。** 现在的状态条没有 Esc 取消，也不会为此申请权限。`SCU_HUD=0` 仍可关闭状态条（CI / 无 WindowServer）；`SCU_HUD_POS=bottom` 贴屏幕底部。
+
+| 问题 | 计划中的行为 |
+|---|---|
+| 什么时候弹系统授权提示 | 只在小窗口的 Esc 取消功能开启时 |
+| 授权在哪 | 系统设置 → 隐私与安全性 → 输入监控 |
+| 用户拒绝之后 | 只是不能用 Esc 取消，其他操作照常 |
+| Esc 会不会被吃掉 | 不会。Esc 只监听、不拦截，因此也会到达前台应用 |
+| 取消何时生效 | 只在两步之间。正在执行的单个 AX 调用不能被打断 |
+| 取消后的返回 | `cancelled`，并带上已完成的步数 |
+
 ## 10. 截图为什么不走 ScreenCaptureKit
 
 SCK 需要真正的 app 生命周期 + 主 runloop。在纯 CLI 进程里调用会直接崩：
@@ -292,9 +323,9 @@ Assertion failed: (did_initialize), function CGS_REQUIRE_INIT
 
 这就是 Codex 要单独打包一个签名 `.app` 的原因。
 
-本项目选择 `screencapture -R <窗口矩形>`：零依赖、任何 CLI 都能跑、启动快。代价是**矩形内的其他窗口会被拍进去**，跨 Space / 多屏时可能拍到别的内容（实测确认）。
+本项目的 `scu shot` 不在 CLI 进程里调 SCK。能解析到窗口 ID 时用 `screencapture -x -o -l <windowID>`：按窗口抓，不受 Space 和遮挡影响。窗口 ID 来自 `winid`，按 pid + 几何在 `CGWindowList(optionAll)` 里找（`optionAll` 才能看到别的 Space 上的窗口）。没有窗口 ID 时才退回 `screencapture -R <窗口矩形>`。`-R` 拍的是屏幕区域，矩形里盖在上面的其他窗口会被拍进去，跨 Space / 多屏时可能拍到别的内容；响应里的 `note` 会说明只有这条退路才会这样。
 
-截图只做兜底。真要纯净窗口图，得做一个 `.app` 走 SCK —— 这是个明确的后续项。
+截图只做兜底。
 
 ---
 

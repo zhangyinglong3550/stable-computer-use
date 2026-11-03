@@ -79,17 +79,38 @@ scu click --app X --xy 100,200 --via mouse --take-over --idle-seconds 2
 
 ### 为什么能做到不动鼠标
 
-Codex 的 computer-use 也是这么做的——我拆了它的二进制，它**根本不合成鼠标事件**：
+Codex 是否同样不合成鼠标事件，**待核实**（来源和复查办法见本节末尾）。提交 [`ec4c352`](https://github.com/zhangyinglong3550/stable-computer-use/commit/ec4c352)（2026-10-27 16:33，北京时间）拆过二进制，当时观察到：
 
 ```
 SkyComputerUseService 导入的符号里没有 CGEventPost / CGEventPostToPid / IOHIDPostEvent
 只有 AXUIElementPerformAction、AXUIElementSetAttributeValue、AXUIElementCopyElementAtPosition
 ```
 
+这是符号观察，不是「Codex 不合成键鼠事件」的结论。
+
 唯一绕不开的是真键盘输入：`CGEvent.postToPid` 能把事件定向投给某个进程且不移动鼠标。
 鼠标事件实测有效（Finder 后台窗口收到了定向点击）；键盘事件取决于目标窗口是否 key window，
 app 可能直接丢弃。所以键盘的定向投递结果**永远标 `unverified(synthetic_input)`**，
 真要保证送到就显式 `--via mouse --take-over`。
+
+#### 待核实：Codex 是否合成键鼠事件
+
+「导入符号里没有 `CGEventPost` / `CGEventPostToPid` / `IOHIDPostEvent`」推不出「不合成键鼠事件、全部走 AX 动作」。事件仍可能经 NSEvent 转换或私有接口投递。下面两种说法都先并列，核实之前不当结论。官方来源查不到：OpenAI 博客和 ChatGPT Learn 文档只说用自己的光标看、点、打字，以及可以和剪贴板交互，没有说明底层是 AX 动作还是合成事件。
+
+**说法 A（本仓库）**
+
+- 提交 [`ec4c352`](https://github.com/zhangyinglong3550/stable-computer-use/commit/ec4c352)，2026-10-27 16:33（北京时间）。上一个提交 `8266604` 里还没有这段话。
+- 观察到 SkyComputerUseService 的导入符号里没有 `CGEventPost` / `CGEventPostToPid` / `IOHIDPostEvent`，只有 `AXUIElementPerformAction`、`AXUIElementSetAttributeValue`、`AXUIElementCopyElementAtPosition`。
+- 仓库没有记录当时拆的是哪个版本的二进制。
+
+**说法 B（第三方逆向，都不是官方）**
+
+- [waku 文档](https://github.com/egoist/waku/blob/6d433e87/docs/sky-macos-accessibility-reverse-engineering.md)：分析 `@oai/sky` 0.6.2，服务版本 26.727.1000550。文档首次提交 2026-08-04（北京时间）；上面的链接固定在 `6d433e87`，那次提交是 2026-08-12（北京时间）。说法是坐标点击先构造 NSEvent，再转成 CGEvent，带上窗口 ID，「posted directly to the target PID」；键盘通过 `SynthesizedEvent` 生成按 PID 投递的事件；后台焦点靠 `SyntheticAppFocusEnforcer` 加 event tap。作者自己标注这部分是「语义重建，不是源码」，具体用哪个投递函数没有写明。
+- [paralym/codex-computer-use-cli](https://github.com/paralym/codex-computer-use-cli)：README 日期 2026-05-02。同时写了「没有 `CGEventPost` 符号」和「用 `SyntheticAppFocusEnforcer`、`NSEvent.mouseEvent(windowNumber:)` 做可信投递」。
+- [vtomnet 的字符串分析](https://github.com/vtomnet/codex-cua-tea/blob/main/SkyComputerUseService.md)：2026-04-17。说它 “uses event taps and synthetic CGEvent input”。
+- [openai/codex issue #53861](https://github.com/openai/codex/issues/53861)：用户在 2026-10-14（北京时间）提交，作者标记为 NONE，不是 OpenAI 员工。报告说 `CGGetEventTapList` 显示 SkyComputerUseService 持有 3–5 个按进程的键盘 tap，二进制里有 `keyboardEventTap`、`SystemFocusStealPreventer`。
+
+复查办法：在 Mac 上对当前安装的服务版本用 `nm` / `otool` 复查导入符号；在 Codex 执行后台操作时用 `CGGetEventTapList` 看它有没有装 event tap。更细的对照见 `docs/design.md` §9.1。
 
 ## 三档投递 + verification
 
@@ -115,7 +136,15 @@ verified · via ax
 - 写动作开始就亮，结束 1.6 秒后淡出；只读的 `snapshot` 不弹，不会一直闪。
 - 圆点颜色：绿 = `verified`，橙 = `unverified`，红 = 失败（显示 `reasonCode`）。
 - `SCU_HUD=0` 关闭（CI / 无 WindowServer）；`SCU_HUD_POS=bottom` 放到屏幕底部。
-- 它只是展示层，不申请任何额外权限；判断成败仍然只认 `verification`。
+- 当前这条状态条只是展示层，不申请任何额外权限；判断成败仍然只认 `verification`。
+
+**计划中 / 即将加入（尚未实现，不要当成现有行为）：** 把操作时的状态条换成 Codex 式小窗口，显示「正在操作你的电脑 · 按 Esc 取消」。Esc 取消用全局键盘监听，需要 macOS 的「输入监控」权限。现在的状态条没有 Esc 取消，也不会为此申请权限。
+
+- 系统授权提示只在小窗口的 Esc 取消功能开启时才会出现。授权在 **系统设置 → 隐私与安全性 → 输入监控**。
+- 用户拒绝授权后，只是不能用 Esc 取消，其他操作照常。
+- Esc 只监听、不拦截，因此这一下 Esc 也会到达前台应用。
+- 取消只在两步之间生效。正在执行的单个 AX 调用不能被打断。被取消时返回 `cancelled`，并带上已完成的步数。
+- 状态条仍用 `SCU_HUD=0` 关闭；`SCU_HUD_POS=bottom` 放到屏幕底部。
 
 为什么它不单独做成 app：见 `docs/design.md` 第 9 节 —— Codex 的执行器是独立 `.app`，
 但屏幕上那条浮窗反而是主 app 的 Electron 窗口。
@@ -331,7 +360,10 @@ scu snapshot --app Finder                   # AX 树，带稳定 ref
 scu snapshot --app Finder --json            # 同上，结构化
 
 scu click --app Finder --ref 3netay         # 按 ref 点击（推荐）
-scu click --app Finder --text "搜索"        # 按名字点击
+# 后台服务在线时 scu click --text 不会按文字点击：服务端 click 不认 text，返回 bad_args。
+# 按文字点击用 JS act：{ op: "click", text: "搜索" }。
+# daemon 连不上，或不带 --wait 且加了 --via mouse / --take-over 时，才走一次性进程，那时 --text 会按文字点。
+# 带 --wait 且服务在线时，text 进入 actAndWait，被当成往焦点元素输入，仍然不是按文字点击。
 scu click --app Finder --ref R --via ax     # 走 AXPress，不动鼠标、不抢焦点
 scu type  --app TextEdit --text "hello"
 scu key   --app Finder --key "super+n"
@@ -339,7 +371,7 @@ scu scroll --app Safari --ref R --direction down --pages 2
 scu set   --app TextEdit --ref R --value "全文替换"
 
 scu verify --app Finder --ref 3netay        # 执行前校验：还在吗？可点吗？位置在哪？
-scu shot  --app Finder --out /tmp/f.png     # 窗口矩形截图
+scu shot  --app Finder --out /tmp/f.png     # 按窗口 ID 截图（无 ID 时退回矩形）
 
 scu decide --app Finder --goal '点击"搜索"'
 scu do     --app Finder --goal '点击"搜索"'  # decide + act 一次做完
@@ -425,7 +457,7 @@ export TYPESAFE_API_KEY=...
 | 限制 | 说明 |
 |---|---|
 | **Electron app 可能没有 AX 树** | 飞书、Sublime 有时 `AXWindows` 返回 0 个窗口。需要 app 自己打开 `AXManualAccessibility`。兜底是截图 + 坐标 |
-| **矩形截图会串窗口** | `scu shot` 用 `screencapture -R`，盖在目标窗口上的其他窗口会被拍进去。跨 Space / 多屏时可能拍到别的内容。需要纯净窗口图得走 ScreenCaptureKit（要一个 .app 上下文） |
+| **拿不到窗口 ID 时，矩形截图会串窗口** | `scu shot` 优先 `screencapture -x -o -l <windowID>`（`winid` 按 pid + 窗口几何在 `CGWindowList(optionAll)` 里找 ID），按窗口抓，不受 Space 和遮挡影响。只有拿不到窗口 ID 时才退回 `screencapture -R <窗口矩形>`：这时盖在目标窗口上的其他窗口会被拍进去，跨 Space / 多屏时可能拍到别的内容，响应里的 `note` 会说明 |
 | **无文字容器排最后** | 兜底候选优先给有文字的元素，纯图标按钮可能选不中，用 ref 或坐标 |
 | **鼠标点击需要窗口在前台** | `--via ax` 可以不动鼠标不抢焦点，但不是所有控件都支持 AXPress；`--via pid` 能把事件定向投给后台进程，但 app 可能因为窗口不是 key window 而忽略，结果标 `unverified(synthetic_input)` |
 | **daemon 的 app 列表会陈旧** | `NSWorkspace.runningApplications` 依赖 workspace 通知，daemon 没有 runloop，会一直看到启动那刻的快照（新开的 app 永远 `app_not_found`）。已改为 workspace 缓存 + 内核进程表兜底 |
